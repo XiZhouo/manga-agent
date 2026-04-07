@@ -1,0 +1,32 @@
+# Deep Learning & CV
+torch
+torchvision
+opencv-python
+numpy
+Pillow
+ultralytics
+onnxruntime
+
+# OCR & Detection
+manga-ocr
+# dbnet or maskrcnn dependencies would go here
+pdf2image
+rarfile
+fastmcp
+
+# Vector DB (Optional for future)
+chromadb
+faiss-cpu
+
+# LLM & LangChain
+openai
+anthropic
+langchain
+langchain-openai
+langchain-community
+tiktoken
+
+# Utils
+pyyaml
+requests
+tqdm
