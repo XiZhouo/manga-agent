@@ -1,0 +1,49 @@
+{
+  "version": "0.1.0",
+  "bucket": "glossary",
+  "entries": [
+    {
+      "type": "quote",
+      "src_text": "may the force be with you",
+      "tgt_text": "原力与你同在",
+      "locked": true,
+      "aliases_src": [],
+      "aliases_tgt": [
+        "希望力量陪着你"
+      ],
+      "scope": "project",
+      "source": "user_revision",
+      "entry_id": "00a3670e-53e5-4154-b5cd-260cab827310",
+      "updated_at": "2026-04-08T20:15:03+00:00"
+    },
+    {
+      "type": "quote",
+      "src_text": "Hello",
+      "tgt_text": "原力与你同在",
+      "locked": true,
+      "aliases_src": [],
+      "aliases_tgt": [
+        "希望力量陪着你"
+      ],
+      "scope": "project",
+      "source": "user_revision",
+      "entry_id": "90129959-5d04-4a37-bc80-771c54d99dd7",
+      "updated_at": "2026-04-08T20:45:04+00:00"
+    },
+    {
+      "type": "term",
+      "src_text": "World",
+      "tgt_text": "天下",
+      "locked": false,
+      "aliases_src": [],
+      "aliases_tgt": [
+        "世界"
+      ],
+      "scope": "project",
+      "source": "user_revision",
+      "entry_id": "9a292635-86a1-4621-a8c6-bf530d97bc44",
+      "updated_at": "2026-04-08T20:45:04+00:00"
+    }
+  ],
+  "updated_at": "2026-04-08T20:45:04+00:00"
+}

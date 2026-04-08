@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastmcp import FastMCP
 
@@ -16,6 +16,7 @@ def translate_page(
     reading_direction: str = "ltr",
     source_language: str = "en",
     target_language: str = "zh",
+    retrieval_context: Optional[Dict[str, Any]] = None,
     model: str = "qwen3.6-plus",
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
     temperature: float = 0.0,
@@ -42,6 +43,7 @@ def translate_page(
         reading_direction=reading_direction,
         source_language=source_language,
         target_language=target_language,
+        retrieval_context=retrieval_context,
         config=cfg,
     )
 

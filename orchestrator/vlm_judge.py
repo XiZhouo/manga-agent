@@ -5,9 +5,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage
-
-from orchestrator.llm_adapter import LLMConfig, build_chat_llm
+# NOTE: LangChain dependencies are optional for offline/stub runs.
+# We import them lazily only when the judge is actually invoked.
 
 
 @dataclass(frozen=True)
@@ -177,6 +176,32 @@ def judge_vlm_page_text_only(
         },
     }
 
+    # build_chat_llm reads keys from DASHSCOPE_API_KEY / OPENAI_API_KEY.
+    if not (os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")):
+        return {
+            "ok": False,
+            "data": None,
+            "metrics": {},
+            "error": {
+                "code": "missing_api_key",
+                "message": "Missing DASHSCOPE_API_KEY (preferred) or OPENAI_API_KEY for judge call.",
+            },
+        }
+
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from orchestrator.llm_adapter import LLMConfig, build_chat_llm
+    except Exception as e:
+        return {
+            "ok": False,
+            "data": None,
+            "metrics": {},
+            "error": {
+                "code": "missing_dependency",
+                "message": f"Missing judge dependencies (langchain). Install requirements to enable judge. Detail: {e}",
+            },
+        }
+
     system = SystemMessage(
         content=(
             "You are a QA gate for a comic translation pipeline. "
@@ -189,18 +214,6 @@ def judge_vlm_page_text_only(
     )
 
     human = HumanMessage(content=json.dumps(payload, ensure_ascii=False))
-
-    # build_chat_llm reads keys from DASHSCOPE_API_KEY / OPENAI_API_KEY.
-    if not (os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")):
-        return {
-            "ok": False,
-            "data": None,
-            "metrics": {},
-            "error": {
-                "code": "missing_api_key",
-                "message": "Missing DASHSCOPE_API_KEY (preferred) or OPENAI_API_KEY for judge call.",
-            },
-        }
 
     llm = build_chat_llm(
         LLMConfig(

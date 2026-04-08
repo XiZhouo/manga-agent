@@ -56,13 +56,15 @@ Classic (fallback)
 			-> RegionOCR
 				-> ScriptBuilder(v0)
 					-> Translation(en->zh, glossary-aware)
-						-> Lettering(v0, block text)
+						-> LaMaErase(v0)
+							-> Lettering(v0, block text)
 							-> PackageZIP
 
 VLM core (new)
 	InputNormalization
 		-> VLMPageTranslate(qwen3.6-plus: detect+OCR+translate)
-			-> Lettering(v0, block text)
+			-> LaMaErase(v0)
+				-> Lettering(v0, block text)
 				-> PackageZIP
 ```
 
@@ -101,7 +103,7 @@ To behave like an **agent** (not just a fixed pipeline), the orchestrator suppor
 2) A **DecisionBrain (LLM)** parses it into a structured plan (`job.pending_user_plan`).
 3) The DecisionEngine executes the plan (ask user / rerun page / run revision).
 4) For corrections, we run a **text-only revision skill** that patches existing VLM outputs (no image upload, no VLM rerun).
-5) Only affected pages are re-lettered.
+5) Only affected pages are re-lettered, reusing cached erased pages whenever possible.
 
 Brain knobs:
 
@@ -149,6 +151,12 @@ Even if correction is “within job”, we still generate editable artifacts so 
 
 - `glossary.json` (editable by user; re-upload to update within job)
 - `run_manifest.json` (internal index; used to map text -> page/bubble)
+- `erased/page_XXXX.png` (cached inpaint result; reused for re-typesetting)
+- `memory/glossary.json`
+- `memory/translation_memory.json`
+- `memory/style_memory.json`
+- `memory/project_memory.json`
+- `memory/brain_memory.json`
 
 NOTE: `run_manifest.json` should be considered internal; it is allowed to be packaged but is not meant as user UX.
 
@@ -156,6 +164,17 @@ NOTE: `run_manifest.json` should be considered internal; it is allowed to be pac
 
 We implement “RAG” as a pluggable retrieval layer. v0 can be exact/alias matching;
 later we can swap retrieval backend to vector DB without changing the translation I/O.
+
+Current retrieval inputs include:
+
+- locked glossary entries
+- user-confirmed translation memory from revision
+- style hints
+- project rules
+- neighbor-page translated examples
+
+Brain planning uses a separate `brain_memory.json` bucket for recent user intents / corrections,
+but it reuses the same retrieval layer to pull relevant terminology, style hints, and project rules.
 
 `glossary.json` example:
 
@@ -238,7 +257,7 @@ page_index, image_bytes, reading_direction, source_language=en, target_language=
 Output payload:
 
 ```text
-regions: [{region_id, bbox_xywh, src_text, tgt_text}]
+regions: [{region_id, bbox_xywh, has_text_box, src_text, tgt_text}]
 image_size: {width, height}
 ```
 ```
@@ -293,7 +312,7 @@ conflicts: [{src_text, candidates[]}]
 Input:
 
 ```text
-image_bytes, regions[{region_id, bbox_xywh, translated_text}], render_params_hint?
+image_bytes, regions[{region_id, bbox_xywh, has_text_box, translated_text}], render_params_hint?
 ```
 
 Output payload:
@@ -324,4 +343,3 @@ zip_bytes, zip_filename
 3) Implement `translate_script_en2zh` (v0) with glossary context + JSON output.
 4) Move `main.py` to orchestrator-driven CLI (thin wiring only).
 5) Add VLM core workflow (qwen3.6-plus) + `pipeline_mode` switch.
-

@@ -1,0 +1,49 @@
+{
+  "version": "0.1.0",
+  "bucket": "translation_memory",
+  "entries": [
+    {
+      "type": "quote",
+      "src_text": "Hello",
+      "tgt_text": "原力与你同在",
+      "scope": "project",
+      "source": "user_revision",
+      "locked": false,
+      "page_index": 0,
+      "region_id": 1,
+      "expected_old_tgt": "希望力量陪着你",
+      "why": "User corrected a known quote.",
+      "updated_at": "2026-04-08T20:15:03+00:00",
+      "entry_id": "201c8940-6628-42c4-936e-fcd5bed2c3a2"
+    },
+    {
+      "type": "phrase",
+      "src_text": "Hello",
+      "tgt_text": "原力与你同在",
+      "scope": "project",
+      "source": "user_revision",
+      "locked": false,
+      "page_index": 0,
+      "region_id": 1,
+      "expected_old_tgt": "希望力量陪着你",
+      "why": "Auto RAG aligned the franchise quote.",
+      "updated_at": "2026-04-08T20:45:04+00:00",
+      "entry_id": "109e9746-3e70-41d5-967f-f1482f07d5d6"
+    },
+    {
+      "type": "term",
+      "src_text": "World",
+      "tgt_text": "天下",
+      "scope": "project",
+      "source": "user_revision",
+      "locked": false,
+      "page_index": 1,
+      "region_id": 2,
+      "expected_old_tgt": "世界",
+      "why": "User requested a different term.",
+      "updated_at": "2026-04-08T20:45:04+00:00",
+      "entry_id": "73105a01-3430-40ea-af69-2c9dd9f09516"
+    }
+  ],
+  "updated_at": "2026-04-08T20:45:04+00:00"
+}

@@ -120,6 +120,7 @@ class Tools:
         source_language: str = "en",
         target_language: str = "zh",
         force_fullres: bool = False,
+        retrieval_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """VLM core: detect + OCR + translate on a page in one call.
 
@@ -183,6 +184,7 @@ class Tools:
                 reading_direction=reading_direction,
                 source_language=source_language,
                 target_language=target_language,
+                retrieval_context=retrieval_context,
                 config=cfg,
             )
 
@@ -206,6 +208,7 @@ class Tools:
                     reading_direction=reading_direction,
                     source_language=source_language,
                     target_language=target_language,
+                    retrieval_context=retrieval_context,
                     config=cfg_full,
                 )
                 if raw2.get("ok"):
@@ -222,6 +225,7 @@ class Tools:
                         "region_id": int(r.get("region_id")),
                         "bbox": r.get("bbox_xywh"),
                         "region_type": "text",
+                        "has_text_box": r.get("has_text_box"),
                         "src_text": r.get("src_text", ""),
                         "tgt_text": r.get("tgt_text", ""),
                     }
@@ -282,6 +286,7 @@ class Tools:
         self,
         *,
         pages: List[Dict[str, Any]],
+        revision_mode: str,
         user_request: str,
         reference_page_number: Optional[int],
         scope: str,
@@ -291,6 +296,7 @@ class Tools:
         reading_direction: str,
         target_language: str,
         glossary: Optional[Dict[str, Any]] = None,
+        retrieval_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Text-only revision for VLM translation outputs (no image upload, no VLM rerun).
 
@@ -317,6 +323,7 @@ class Tools:
 
             return revise_vlm_translation(
                 pages=pages,
+                revision_mode=revision_mode,
                 user_request=user_request,
                 reference_page_number=reference_page_number,
                 scope=scope,
@@ -326,6 +333,7 @@ class Tools:
                 reading_direction=reading_direction,
                 target_language=target_language,
                 glossary=glossary,
+                retrieval_context=retrieval_context,
                 config=cfg,
             )
         except Exception as e:
@@ -352,7 +360,14 @@ class Tools:
 
         return {"ok": True, "results": results}
 
-    def run_translation(self, page: PageState, target_language: str) -> Dict[str, Any]:
+    def run_translation(
+        self,
+        page: PageState,
+        target_language: str,
+        *,
+        page_context: str = "",
+        glossary_entries: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         """
         Skill4: 翻译。
 
@@ -362,7 +377,7 @@ class Tools:
         """
         if target_language == "zh":
             try:
-                from skills.translation_en2zh.translate import translate_utterances_en2zh
+                from skills.translation_en2zh.translate import GlossaryEntry, translate_utterances_en2zh
 
                 utterances = [
                     {
@@ -374,10 +389,30 @@ class Tools:
                     for region_id, region in sorted(page.regions.items())
                 ]
 
+                glossary_ctx = []
+                for item in glossary_entries or []:
+                    if not isinstance(item, dict):
+                        continue
+                    src_text = str(item.get("src_text") or "").strip()
+                    tgt_text = str(item.get("tgt_text") or "").strip()
+                    if not src_text or not tgt_text:
+                        continue
+                    glossary_ctx.append(
+                        GlossaryEntry(
+                            entry_id=str(item.get("entry_id") or f"mem-{src_text}-{tgt_text}"),
+                            src_text=src_text,
+                            tgt_text=tgt_text,
+                            locked=bool(item.get("locked", False)),
+                            aliases_src=[str(x) for x in (item.get("aliases_src") or []) if str(x).strip()],
+                            aliases_tgt=[str(x) for x in (item.get("aliases_tgt") or []) if str(x).strip()],
+                            type=str(item.get("type") or "term"),
+                        )
+                    )
+
                 out = translate_utterances_en2zh(
                     utterances=utterances,
-                    page_context="",
-                    glossary=[],
+                    page_context=page_context,
+                    glossary=glossary_ctx,
                 )
                 if not out.get("ok"):
                     return {"ok": False, "error": out.get("error")}
@@ -404,22 +439,120 @@ class Tools:
 
         return {"ok": True, "results": results, "consistent": True}
 
-    def run_lettering(self, page: PageState) -> Dict[str, Any]:
-        """
-        模拟 Skill5: 自动嵌字。
+    def run_erase(self, page: PageState, *, retry: bool = False, skill_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Skill4b: erase source text only and persist the erased page."""
 
-        这里只简单用“翻译文本过长就可能溢出”来模拟失败。
-        """
+        if page.image_ref:
+            path = Path(page.image_ref)
+            if path.exists() and path.is_file():
+                try:
+                    from skills.lettering_basic_v0.lettering import erase_page_image
+
+                    regions_payload = []
+                    for region_id, region in sorted(page.regions.items()):
+                        regions_payload.append(
+                            {
+                                "region_id": int(region_id),
+                                "bbox_xywh": region.bbox,
+                                "has_text_box": region.has_text_box,
+                                "translated_text": region.translated_text or "",
+                            }
+                        )
+
+                    out = erase_page_image(image_bytes=path.read_bytes(), regions=regions_payload, skill_params=skill_params)
+                    if not out.get("ok"):
+                        return {"ok": False, "error": out.get("error")}
+
+                    erased_bytes = out.get("erased_image_bytes")
+                    if isinstance(erased_bytes, (bytes, bytearray)):
+                        job_dir = path.parent.parent if path.parent.name == "pages" else path.parent
+                        erased_dir = job_dir / "erased"
+                        erased_dir.mkdir(parents=True, exist_ok=True)
+                        out_path = erased_dir / f"page_{page.page_index:04d}.png"
+                        out_path.write_bytes(bytes(erased_bytes))
+                        page.erased_image_ref = str(out_path)
+
+                    coarse_mask_bytes = out.get("coarse_mask_bytes")
+                    mask_bytes = out.get("mask_bytes")
+                    overlay_bytes = out.get("mask_overlay_bytes")
+                    if any(isinstance(x, (bytes, bytearray)) for x in [coarse_mask_bytes, mask_bytes, overlay_bytes]):
+                        job_dir = path.parent.parent if path.parent.name == "pages" else path.parent
+                        masks_dir = job_dir / "masks"
+                        masks_dir.mkdir(parents=True, exist_ok=True)
+                        stem = f"page_{page.page_index:04d}"
+                        if isinstance(coarse_mask_bytes, (bytes, bytearray)):
+                            (masks_dir / f"{stem}_coarse.png").write_bytes(bytes(coarse_mask_bytes))
+                        if isinstance(mask_bytes, (bytes, bytearray)):
+                            (masks_dir / f"{stem}_refined.png").write_bytes(bytes(mask_bytes))
+                        if isinstance(overlay_bytes, (bytes, bytearray)):
+                            (masks_dir / f"{stem}_overlay.png").write_bytes(bytes(overlay_bytes))
+
+                    metrics = out.get("metrics") or {}
+                    return {
+                        "ok": True,
+                        "erase_backend": metrics.get("erase_backend"),
+                        "results": out.get("results") or {},
+                        "metrics": metrics,
+                    }
+                except Exception as e:
+                    return {"ok": False, "error": {"code": "erase_exception", "message": str(e)}}
+
+        # fallback mock for no-file demo runs
+        return {"ok": True, "erase_backend": "mock", "results": {}, "metrics": {"erase_backend": "mock"}}
+
+    def run_typeset(self, page: PageState, *, skill_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Skill5: typeset translated text onto an erased page."""
+
+        input_ref = page.erased_image_ref or page.image_ref
+        if input_ref:
+            path = Path(input_ref)
+            if path.exists() and path.is_file():
+                try:
+                    from skills.lettering_basic_v0.lettering import typeset_page_image
+
+                    regions_payload = []
+                    for region_id, region in sorted(page.regions.items()):
+                        regions_payload.append(
+                            {
+                                "region_id": int(region_id),
+                                "bbox_xywh": region.bbox,
+                                "has_text_box": region.has_text_box,
+                                "translated_text": region.translated_text or "",
+                            }
+                        )
+
+                    out = typeset_page_image(image_bytes=path.read_bytes(), regions=regions_payload, skill_params=skill_params)
+                    if not out.get("ok"):
+                        return {"ok": False, "error": out.get("error")}
+
+                    rendered_bytes = out.get("rendered_image_bytes")
+                    if isinstance(rendered_bytes, (bytes, bytearray)):
+                        job_dir = path.parent.parent if path.parent.name in {"pages", "erased"} else path.parent
+                        rendered_dir = job_dir / "rendered"
+                        rendered_dir.mkdir(parents=True, exist_ok=True)
+                        out_path = rendered_dir / f"page_{page.page_index:04d}.png"
+                        out_path.write_bytes(bytes(rendered_bytes))
+                        page.rendered_image_ref = str(out_path)
+
+                    return {"ok": True, "results": out.get("results") or {}, "metrics": out.get("metrics") or {}}
+                except Exception as e:
+                    return {"ok": False, "error": {"code": "typeset_exception", "message": str(e)}}
+
+        # fallback mock for no-file demo runs
         results = {}
         for region_id, region in page.regions.items():
             translated = region.translated_text or ""
             overflow = len(translated) > 60
-            results[region_id] = {
-                "render_ok": not overflow,
-                "overflow": overflow,
-            }
+            results[region_id] = {"render_ok": not overflow, "overflow": overflow}
+        return {"ok": True, "results": results, "metrics": {}}
 
-        return {"ok": True, "results": results}
+    def run_lettering(self, page: PageState) -> Dict[str, Any]:
+        """Backward-compatible wrapper for older tests/scripts."""
+
+        erase = self.run_erase(page)
+        if not erase.get("ok"):
+            return erase
+        return self.run_typeset(page)
 
     def ask_user(self, reason: str) -> Dict[str, Any]:
         """

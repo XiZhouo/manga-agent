@@ -6,9 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage
-
-from orchestrator.llm_adapter import LLMConfig, build_chat_llm
+# NOTE: LangChain dependencies are optional for offline/stub runs.
+# We import them lazily only when the brain is actually invoked.
 
 
 @dataclass(frozen=True)
@@ -81,6 +80,8 @@ class DecisionBrain:
         page_count: int,
         pipeline_mode: str,
         target_language: str,
+        brain_context: Optional[Dict[str, Any]] = None,
+        skill_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Return a structured plan for a user message.
 
@@ -153,15 +154,38 @@ class DecisionBrain:
         model = os.getenv("MANGA_AGENT_BRAIN_MODEL", cfg.model)
         temperature = float(os.getenv("MANGA_AGENT_BRAIN_TEMPERATURE", str(cfg.temperature)))
 
+        try:
+            from langchain_core.messages import HumanMessage, SystemMessage
+            from orchestrator.llm_adapter import LLMConfig, build_chat_llm
+        except Exception:
+            # fallback heuristic plan (no LLM)
+            return {
+                "intent": "unknown",
+                "needs_clarification": False,
+                "clarifying_question": None,
+                "reference_page_number": _extract_page_number_heuristic(user_message),
+                "scope": "global" if any(k in user_message for k in ("所有", "全部", "全书", "全本", "都")) else "page_only",
+                "from_side": "auto",
+                "from_text": None,
+                "to_text": None,
+                "glossary_type": None,
+                "apply_glossary": False,
+                "confidence": None,
+            }
+
         system = SystemMessage(
             content=(
                 "You are the decision brain of a comic translation agent. "
-                "You interpret user feedback and produce a STRICT JSON plan for the orchestrator. "
-                "Do NOT ask the user whether 'xxx is source or target'; infer it yourself. "
-                "Only ask clarification when required: reference example (page number) and scope (page-only vs global). "
-                "Target language is provided. "
-                "Return STRICT JSON only (no markdown)."
-            )
+            "You interpret user feedback and produce a STRICT JSON plan for the orchestrator. "
+            "Do NOT ask the user whether 'xxx is source or target'; infer it yourself. "
+            "Only ask clarification when required: reference example (page number) and scope (page-only vs global). "
+            "You may receive brain_context summarizing prior user preferences, recent corrections, relevant terminology, and project rules. "
+            "Use it to stay consistent with past decisions, but prioritize the current user message if there is any conflict. "
+            "You may also receive skill_context describing supported skill parameters. "
+            "If the user seems to want quality/style changes, you may propose skill_param_suggestions, but only for supported skills/params from skill_context. "
+            "Target language is provided. "
+            "Return STRICT JSON only (no markdown)."
+        )
         )
 
         payload = {
@@ -173,6 +197,8 @@ class DecisionBrain:
                 "target_language": target_language,
                 "note": "User page numbers are human-facing; usually 1-based.",
             },
+            "brain_context": brain_context or {},
+            "skill_context": skill_context or {},
             "output_schema": {
                 "intent": "correction|rerun_page|preference|unknown",
                 "needs_clarification": "bool",
@@ -184,6 +210,16 @@ class DecisionBrain:
                 "to_text": "string|null",
                 "glossary_type": "term|quote|name|phrase|null",
                 "apply_glossary": "bool",
+                "skill_param_suggestions": {
+                    "lama_eraser": {"profile": "enum?", "mask_dilate_px": "int?"},
+                    "lettering": {
+                        "render_mode": "enum?",
+                        "padding_ratio": "float?",
+                        "line_spacing": "float?",
+                        "stroke_width": "int?",
+                        "max_font_size_ratio": "float?"
+                    }
+                },
                 "confidence": "float_0_to_1|null",
             },
         }
@@ -244,6 +280,9 @@ class DecisionBrain:
             to_text = None
 
         apply_glossary = bool(data.get("apply_glossary"))
+        skill_param_suggestions = data.get("skill_param_suggestions")
+        if not isinstance(skill_param_suggestions, dict):
+            skill_param_suggestions = {}
 
         conf = data.get("confidence")
         try:
@@ -262,5 +301,6 @@ class DecisionBrain:
             "to_text": to_text,
             "glossary_type": glossary_type,
             "apply_glossary": apply_glossary,
+            "skill_param_suggestions": skill_param_suggestions,
             "confidence": conf,
         }

@@ -1,0 +1,81 @@
+{
+  "version": "0.1.0",
+  "bucket": "brain_memory",
+  "entries": [
+    {
+      "entry_id": "6f0e7eea-902d-4bec-a159-10b505c8f2ce",
+      "type": "correction",
+      "src_text": "第1页的 Hello 应该翻译成 原力与你同在，请修改所有相关的问题",
+      "tgt_text": "intent=correction; scope=global; ref=1; patch=Hello->你好",
+      "scope": "brain",
+      "source": "user_message",
+      "updated_at": "2026-04-08T19:49:41+00:00",
+      "plan": {
+        "intent": "correction",
+        "needs_clarification": false,
+        "clarifying_question": null,
+        "reference_page_number": 1,
+        "scope": "global",
+        "from_side": "src",
+        "from_text": "Hello",
+        "to_text": "你好",
+        "glossary_type": "quote",
+        "apply_glossary": true,
+        "confidence": 0.9,
+        "user_message": "第1页的 Hello 应该翻译成 原力与你同在，请修改所有相关的问题"
+      },
+      "note": null
+    },
+    {
+      "entry_id": "ac12af36-c8aa-4d7e-943b-072e65e26a2c",
+      "type": "correction",
+      "src_text": "第1页的 Hello 应该翻译成 原力与你同在，请修改所有相关的问题",
+      "tgt_text": "intent=correction; scope=global; ref=1; patch=Hello->你好",
+      "scope": "brain",
+      "source": "user_message",
+      "updated_at": "2026-04-08T20:15:03+00:00",
+      "plan": {
+        "intent": "correction",
+        "needs_clarification": false,
+        "clarifying_question": null,
+        "reference_page_number": 1,
+        "scope": "global",
+        "from_side": "src",
+        "from_text": "Hello",
+        "to_text": "你好",
+        "glossary_type": "quote",
+        "apply_glossary": true,
+        "confidence": 0.9,
+        "user_message": "第1页的 Hello 应该翻译成 原力与你同在，请修改所有相关的问题",
+        "skill_param_suggestions": {}
+      },
+      "note": null
+    },
+    {
+      "entry_id": "112c8541-05ab-4c8e-8e4e-c33705293fb1",
+      "type": "correction",
+      "src_text": "第1页的 World 应该翻译成 天下，请修改所有相关的问题",
+      "tgt_text": "intent=correction; scope=global; ref=1; patch=World->天下",
+      "scope": "brain",
+      "source": "user_message",
+      "updated_at": "2026-04-08T20:45:04+00:00",
+      "plan": {
+        "intent": "correction",
+        "needs_clarification": false,
+        "clarifying_question": null,
+        "reference_page_number": 1,
+        "scope": "global",
+        "from_side": "src",
+        "from_text": "World",
+        "to_text": "天下",
+        "glossary_type": "term",
+        "apply_glossary": true,
+        "confidence": 0.9,
+        "user_message": "第1页的 World 应该翻译成 天下，请修改所有相关的问题",
+        "skill_param_suggestions": {}
+      },
+      "note": null
+    }
+  ],
+  "updated_at": "2026-04-08T20:45:04+00:00"
+}

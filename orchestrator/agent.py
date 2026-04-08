@@ -21,14 +21,29 @@ from .store import StateStore
 from .decision_engine import DecisionEngine
 from .tools import Tools
 from .brain import DecisionBrain
+from .memory_store import LocalMemoryStore, utc_iso
+from .retrieval import RetrievalContextBuilder
+from .skill_specs import build_skill_context_for_brain, sanitize_skill_param_suggestions
 
 
 class SimpleMemory:
     """
     极简 memory：
-    这里只更新用户偏好，不存完整业务状态。
-    业务状态由 JobState/PageState/RegionState 存。
+    负责：
+    - 更新用户偏好
+    - 维护本地 JSON memory buckets
+    - 为翻译/VLM 组装 retrieval context
     """
+
+    def __init__(self) -> None:
+        self.store = LocalMemoryStore()
+        self.retrieval = RetrievalContextBuilder()
+
+    def initialize_job(self, job: JobState) -> None:
+        self.store.ensure_initialized(job)
+
+    def snapshot(self, job: JobState) -> Dict[str, Any]:
+        return self.store.snapshot(job)
 
     def update_preferences(self, job: JobState, user_message: str) -> None:
         if "中文" in user_message:
@@ -37,8 +52,117 @@ class SimpleMemory:
             job.user_preferences["target_language"] = "en"
         if "更夸张" in user_message:
             job.user_preferences["sfx_style"] = "exaggerated"
+            self.store.add_style_hint(job, message=user_message, key="sfx_style", value="exaggerated")
         if "术语统一" in user_message:
             job.user_preferences["strict_glossary"] = True
+            self.store.add_project_rule(job, message=user_message, key="strict_glossary", value="enabled")
+
+    def build_vlm_retrieval(self, job: JobState, page: PageState) -> Dict[str, Any]:
+        return self.retrieval.build_for_vlm(job, page, self.snapshot(job))
+
+    def build_translation_retrieval(self, job: JobState, page: PageState) -> Dict[str, Any]:
+        return self.retrieval.build_for_translation(job, page, self.snapshot(job))
+
+    def build_revision_retrieval(self, job: JobState, page: PageState) -> Dict[str, Any]:
+        return self.retrieval.build_for_translation(job, page, self.snapshot(job))
+
+    def build_brain_context(self, job: JobState, *, user_message: str) -> Dict[str, Any]:
+        return self.retrieval.build_for_brain(job, user_message=user_message, snapshot=self.snapshot(job))
+
+    def record_brain_event(
+        self,
+        job: JobState,
+        *,
+        user_message: str,
+        plan: Optional[Dict[str, Any]] = None,
+        note: Optional[str] = None,
+    ) -> None:
+        summary_parts: List[str] = []
+        if isinstance(plan, dict) and plan:
+            intent = str(plan.get("intent") or "unknown")
+            scope = str(plan.get("scope") or "page_only")
+            ref = plan.get("reference_page_number")
+            from_text = str(plan.get("from_text") or "").strip()
+            to_text = str(plan.get("to_text") or "").strip()
+            if intent:
+                summary_parts.append(f"intent={intent}")
+            if scope:
+                summary_parts.append(f"scope={scope}")
+            if ref is not None:
+                summary_parts.append(f"ref={ref}")
+            if from_text and to_text:
+                summary_parts.append(f"patch={from_text}->{to_text}")
+        if note:
+            summary_parts.append(str(note))
+        summary = "; ".join(summary_parts) if summary_parts else "user_message"
+        event_type = str((plan or {}).get("intent") or "message")
+        extra = {"plan": plan or {}, "note": note}
+        self.store.append_brain_event(
+            job,
+            event_type=event_type,
+            message=user_message,
+            summary=summary,
+            extra=extra,
+        )
+
+    def record_revision_updates(
+        self,
+        job: JobState,
+        *,
+        page_index_to_regions: Dict[int, Dict[int, RegionState]],
+        patches: List[Dict[str, Any]],
+        glossary_updates: List[Dict[str, Any]],
+        glossary_type: Optional[str] = None,
+    ) -> None:
+        glossary_entries: List[Dict[str, Any]] = []
+        for item in glossary_updates:
+            if not isinstance(item, dict):
+                continue
+            entry = dict(item)
+            entry.setdefault("scope", "project")
+            entry.setdefault("source", "user_revision")
+            entry.setdefault("locked", bool(entry.get("locked")))
+            glossary_entries.append(entry)
+
+        if glossary_entries:
+            self.store.upsert_entries(job, "glossary", glossary_entries)
+
+        tm_entries: List[Dict[str, Any]] = []
+        for patch in patches:
+            if not isinstance(patch, dict):
+                continue
+            try:
+                pi = int(patch.get("page_index"))
+                rid = int(patch.get("region_id"))
+            except Exception:
+                continue
+            region = (page_index_to_regions.get(pi) or {}).get(rid)
+            if not region:
+                continue
+            src_text = str(region.ocr_text or "").strip()
+            tgt_text = str(patch.get("new_tgt") or "").strip()
+            if not src_text or not tgt_text:
+                continue
+            tm_entries.append(
+                {
+                    "type": str(glossary_type or "phrase"),
+                    "src_text": src_text,
+                    "tgt_text": tgt_text,
+                    "scope": "project",
+                    "source": "user_revision",
+                    "locked": False,
+                    "page_index": pi,
+                    "region_id": rid,
+                    "expected_old_tgt": patch.get("expected_old_tgt"),
+                    "why": patch.get("why"),
+                    "updated_at": utc_iso(),
+                }
+            )
+
+        if tm_entries:
+            self.store.upsert_entries(job, "translation_memory", tm_entries)
+
+        self.store.sync_job_glossary(job)
 
 
 class ComicAgent:
@@ -67,6 +191,47 @@ class ComicAgent:
         self.decision_engine = decision_engine
         self.memory = memory or SimpleMemory()
         self.brain = brain or DecisionBrain()
+
+    def _resolve_plan_page_index(self, job: JobState, plan: Dict[str, Any]) -> Optional[int]:
+        page_index = None
+        ref_num = plan.get("reference_page_number")
+        try:
+            ref_num = int(ref_num) if ref_num is not None else None
+        except Exception:
+            ref_num = None
+
+        if ref_num is not None:
+            if ref_num == 0 and 0 in job.pages:
+                page_index = 0
+            elif (ref_num - 1) in job.pages:
+                page_index = ref_num - 1
+            elif ref_num in job.pages:
+                page_index = ref_num
+        return page_index
+
+    def _apply_skill_suggestions_from_plan(self, job: JobState, plan: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        clean = sanitize_skill_param_suggestions(plan.get("skill_param_suggestions"))
+        if not clean:
+            return {}
+
+        page_index = self._resolve_plan_page_index(job, plan)
+        scope = str(plan.get("scope") or "page_only").strip().lower()
+        target_pages: List[int]
+        if scope == "global":
+            target_pages = sorted(job.pages.keys())
+        elif page_index is not None and page_index in job.pages:
+            target_pages = [page_index]
+        else:
+            target_pages = [sorted(job.pages.keys())[0]] if job.pages else []
+
+        for pi in target_pages:
+            page = job.pages[pi]
+            merged = dict(page.skill_param_suggestions or {})
+            for skill_name, params in clean.items():
+                prev = merged.get(skill_name) or {}
+                merged[skill_name] = {**prev, **params}
+            page.skill_param_suggestions = merged
+        return clean
 
     # -----------------------------------------------------
     # 对外接口 1：创建任务
@@ -110,6 +275,7 @@ class ComicAgent:
             )
 
         job.logs.append(f"Job created with {len(pages)} pages.")
+        self.memory.initialize_job(job)
         self.store.create_job(job)
         return job_id
 
@@ -127,6 +293,7 @@ class ComicAgent:
 
         # 更新轻量偏好
         self.memory.update_preferences(job, user_message)
+        self.memory.initialize_job(job)
 
         # 如果用户指定某页要重跑，则标记
         wants_rerun = any(k in user_message for k in ("重跑", "重试", "重新", "rerun", "retry"))
@@ -139,18 +306,25 @@ class ComicAgent:
         # Route A: use the decision brain to turn the message into a structured plan.
         try:
             pipeline_mode = str(job.user_preferences.get("pipeline_mode") or "classic").lower()
+            brain_context = self.memory.build_brain_context(job, user_message=user_message)
             plan = self.brain.plan_user_message(
                 user_message=user_message,
                 page_count=len(job.pages),
                 pipeline_mode=pipeline_mode,
                 target_language=job.target_language,
+                brain_context=brain_context,
+                skill_context=build_skill_context_for_brain(),
             )
             if isinstance(plan, dict) and plan:
                 plan.setdefault("user_message", user_message)
+                clean_suggestions = self._apply_skill_suggestions_from_plan(job, plan)
+                plan["skill_param_suggestions"] = clean_suggestions
                 job.pending_user_plan = plan
                 job.logs.append(f"Brain plan: intent={plan.get('intent')} scope={plan.get('scope')} ref={plan.get('reference_page_number')} conf={plan.get('confidence')}")
+                self.memory.record_brain_event(job, user_message=user_message, plan=plan)
         except Exception as e:
             job.logs.append(f"Brain planning skipped/failed: {e}")
+            self.memory.record_brain_event(job, user_message=user_message, note=f"planning_failed: {e}")
 
         job.logs.append(f"Handled user message: {user_message}")
 
@@ -188,20 +362,37 @@ class ComicAgent:
                 break
 
         if digits:
-            return int("".join(digits))
+            n = int("".join(digits))
+            # For bare numbers like "重跑 1" / "retry page 1", interpret as human-facing 1-based.
+            # Users can explicitly request 0-based by mentioning "page_index" or "0-based".
+            lower = (msg or "").lower()
+            if ("page_index" in lower) or ("0-based" in lower) or ("0based" in lower):
+                return n
+            if n <= 0:
+                return 0
+            return n - 1
         return None
 
     # -----------------------------------------------------
     # 对外接口 3：推进任务，直到需要用户或任务完成
     # -----------------------------------------------------
-    def run_until_waiting_or_done(self, job_id: str, max_steps: int = 50) -> JobState:
+    def run_until_waiting_or_done(self, job_id: str, max_steps: Optional[int] = None) -> JobState:
         job = self.store.get_job(job_id)
 
         if job.status == JobStatus.CREATED:
             job.status = JobStatus.RUNNING
             self.store.save_job(job)
 
-        for _ in range(max_steps):
+        # Auto-scale max_steps to avoid truncating medium-sized books.
+        # Classic pipeline needs multiple actions per page; VLM also needs several actions including NO_OP transitions.
+        if max_steps is None or int(max_steps) <= 0:
+            page_count = len(job.pages)
+            pipeline_mode = str(job.user_preferences.get("pipeline_mode") or "classic").lower()
+            steps_per_page = 10 if pipeline_mode == "classic" else 6
+            max_steps = max(200, page_count * steps_per_page + 50)
+            job.logs.append(f"Auto max_steps={max_steps} (pages={page_count}, mode={pipeline_mode}).")
+
+        for _ in range(int(max_steps)):
             job = self.store.get_job(job_id)
             action = self.decision_engine.decide_next_action(job)
             self._log(job, f"Decision: {action.action_type.value}, reason={action.reason}")
@@ -241,7 +432,7 @@ class ComicAgent:
             self.store.save_job(job)
 
         job.status = JobStatus.WAITING_USER
-        job.waiting_reason = "Max steps reached; waiting for user or operator."
+        job.waiting_reason = f"Max steps reached (max_steps={max_steps}); waiting for user or operator."
         self._log(job, "Max steps reached; stopping loop.")
         self.store.save_job(job)
         return job
@@ -288,8 +479,22 @@ class ComicAgent:
             )
             return
 
-        if action.action_type in [ActionType.RUN_LETTERING, ActionType.RETRY_LETTERING]:
-            self._do_lettering(job, page, retry=(action.action_type == ActionType.RETRY_LETTERING))
+        if action.action_type in [ActionType.RUN_ERASE, ActionType.RETRY_ERASE]:
+            self._do_erase(
+                job,
+                page,
+                retry=(action.action_type == ActionType.RETRY_ERASE),
+                skill_params=action.payload.get("skill_params") if isinstance(action.payload, dict) else None,
+            )
+            return
+
+        if action.action_type in [ActionType.RUN_TYPESET, ActionType.RETRY_TYPESET]:
+            self._do_typeset(
+                job,
+                page,
+                retry=(action.action_type == ActionType.RETRY_TYPESET),
+                skill_params=action.payload.get("skill_params") if isinstance(action.payload, dict) else None,
+            )
             return
 
         raise ValueError(f"Unsupported action type: {action.action_type}")
@@ -302,18 +507,22 @@ class ComicAgent:
         """
 
         plan = action.payload or {}
+        revision_mode = str(plan.get("revision_mode") or "user_feedback_revision").strip().lower()
+        page = job.pages[action.page_index]
+        page.stage = PageStage.REVISING
 
-        # Prepare full-book payload in VLM-like schema.
+        target_page_indices = [action.page_index] if revision_mode == "auto_rag_revision" else sorted(job.pages.keys())
         pages_payload: List[Dict[str, Any]] = []
-        for page_index in sorted(job.pages.keys()):
-            page = job.pages[page_index]
+        for page_index in target_page_indices:
+            page_state = job.pages[page_index]
             regions_payload = []
-            for region_id in sorted(page.regions.keys()):
-                r = page.regions[region_id]
+            for region_id in sorted(page_state.regions.keys()):
+                r = page_state.regions[region_id]
                 regions_payload.append(
                     {
                         "region_id": r.region_id,
                         "bbox_xywh": r.bbox,
+                        "has_text_box": r.has_text_box,
                         "src_text": r.ocr_text or "",
                         "tgt_text": r.translated_text or "",
                     }
@@ -321,10 +530,15 @@ class ComicAgent:
             pages_payload.append({"page_index": page_index, "regions": regions_payload})
 
         reading_direction = str(job.user_preferences.get("reading_direction") or "ltr")
+        retrieval_context = self.memory.build_revision_retrieval(job, page)
+        user_request = str(plan.get("user_message") or plan.get("raw") or "")
+        if revision_mode == "auto_rag_revision":
+            user_request = user_request or "Apply one automatic RAG-guided consistency pass to this page."
 
         result = self.tools.run_vlm_translation_revision(
             pages=pages_payload,
-            user_request=str(plan.get("user_message") or plan.get("raw") or ""),
+            revision_mode=revision_mode,
+            user_request=user_request,
             reference_page_number=plan.get("reference_page_number"),
             scope=str(plan.get("scope") or "page_only"),
             from_side=str(plan.get("from_side") or "auto"),
@@ -333,11 +547,23 @@ class ComicAgent:
             reading_direction=reading_direction,
             target_language=job.target_language,
             glossary=job.glossary or {},
+            retrieval_context=retrieval_context,
         )
 
         if not result.get("ok"):
             err = result.get("error") or {}
+            if revision_mode == "auto_rag_revision":
+                page.stage = PageStage.TRANSLATED
+                page.auto_revision_done = True
+                page.auto_revision_changed = False
+                page.revision_mode_last = revision_mode
+                page.revision_warnings = [f"{err.get('code') or 'revision_failed'}: {err.get('message') or 'unknown'}"]
+                page.revision_usage = (result.get("metrics") or {}).get("usage")
+                job.logs.append(f"Auto revision skipped on page {page.page_index}: {err.get('code')} {err.get('message')}")
+                return
+
             job.pending_user_plan = None
+            page.stage = PageStage.TRANSLATED
             job.logs.append(f"Revision failed: {err.get('code')} {err.get('message')}")
             job.status = JobStatus.WAITING_USER
             job.waiting_reason = f"Revision failed: {err.get('message') or err.get('code') or 'unknown'}"
@@ -346,7 +572,18 @@ class ComicAgent:
         data = result.get("data") or {}
         decision = str(data.get("decision") or "apply").strip().lower()
         if decision == "ask_user":
+            if revision_mode == "auto_rag_revision":
+                page.stage = PageStage.TRANSLATED
+                page.auto_revision_done = True
+                page.auto_revision_changed = False
+                page.revision_mode_last = revision_mode
+                page.revision_warnings = [str(data.get("ask_user") or "auto revision skipped")]
+                page.revision_usage = (result.get("metrics") or {}).get("usage")
+                job.logs.append(f"Auto revision skipped on page {page.page_index}: {data.get('ask_user')}")
+                return
+
             q = str(data.get("ask_user") or "Please clarify your correction request.").strip()
+            page.stage = PageStage.TRANSLATED
             job.pending_user_plan = plan
             job.pending_user_plan["needs_clarification"] = True
             job.pending_user_plan["clarifying_question"] = q
@@ -354,9 +591,17 @@ class ComicAgent:
 
         pages_out = data.get("pages") or []
         changed_pages = set(int(x) for x in (data.get("changed_pages") or []) if str(x).strip().isdigit())
+        patches = [x for x in (data.get("patches") or []) if isinstance(x, dict)]
+        glossary_updates = [x for x in (data.get("glossary_updates") or []) if isinstance(x, dict)]
+        warnings = [str(x) for x in (data.get("warnings") or []) if str(x).strip()]
+        usage = (result.get("metrics") or {}).get("usage")
 
         # Merge tgt_text back into state.
         changed_regions = 0
+        regions_before_merge = {
+            pi: {rid: region for rid, region in page.regions.items()}
+            for pi, page in job.pages.items()
+        }
         for p in pages_out:
             try:
                 pi = int(p.get("page_index"))
@@ -387,7 +632,6 @@ class ComicAgent:
                     changed_pages.add(pi)
 
         # Update glossary bucket.
-        glossary_updates = data.get("glossary_updates") or []
         if isinstance(job.glossary, dict):
             entries = job.glossary.get("entries")
             if not isinstance(entries, list):
@@ -397,14 +641,41 @@ class ComicAgent:
             job.glossary["entries"] = entries
             job.glossary["updated_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
+        self.memory.record_revision_updates(
+            job,
+            page_index_to_regions=regions_before_merge,
+            patches=patches,
+            glossary_updates=glossary_updates,
+            glossary_type=(plan.get("glossary_type") if isinstance(plan, dict) else None),
+        )
+
         # Re-run lettering on changed pages.
         for pi in changed_pages:
             if pi in job.pages:
-                job.pages[pi].stage = PageStage.TRANSLATED
+                job.pages[pi].stage = PageStage.ERASED if job.pages[pi].erased_image_ref else PageStage.TRANSLATED
                 job.pages[pi].lettering_ok = False
+                job.pages[pi].translation_consistent = True
+                job.pages[pi].rendered_image_ref = None
 
-        job.logs.append(f"Revision applied: changed_pages={sorted(changed_pages)} changed_regions={changed_regions}")
-        job.pending_user_plan = None
+        if revision_mode == "auto_rag_revision":
+            page.auto_revision_done = True
+            page.auto_revision_changed = bool(changed_regions)
+            page.revision_mode_last = revision_mode
+            page.revision_warnings = warnings
+            page.revision_usage = usage if isinstance(usage, dict) else None
+            if page.stage == PageStage.REVISING:
+                page.stage = PageStage.TRANSLATED
+        else:
+            for pi in target_page_indices:
+                if pi in job.pages:
+                    job.pages[pi].auto_revision_done = True
+                    job.pages[pi].revision_mode_last = revision_mode
+                    job.pages[pi].revision_usage = usage if isinstance(usage, dict) else None
+            job.pending_user_plan = None
+
+        job.logs.append(
+            f"Revision applied: mode={revision_mode} changed_pages={sorted(changed_pages)} changed_regions={changed_regions} warnings={warnings}"
+        )
 
     def _do_detection(self, job: JobState, page: PageState, retry: bool) -> None:
         page.stage = PageStage.DETECTING
@@ -424,6 +695,7 @@ class ComicAgent:
                 region_id=item["region_id"],
                 bbox=item["bbox"],
                 region_type=item.get("region_type", "text"),
+                has_text_box=item.get("has_text_box"),
                 stage=RegionStage.DETECTED,
             )
 
@@ -463,6 +735,7 @@ class ComicAgent:
             source_language=source_language,
             target_language=target_language,
             force_fullres=retry,
+            retrieval_context=self.memory.build_vlm_retrieval(job, page),
         )
 
         if not result.get("ok"):
@@ -482,6 +755,7 @@ class ComicAgent:
                 region_id=region_id,
                 bbox=item.get("bbox"),
                 region_type=item.get("region_type", "text"),
+                has_text_box=item.get("has_text_box"),
                 ocr_text=item.get("src_text"),
                 translated_text=item.get("tgt_text"),
                 stage=RegionStage.TRANSLATED,
@@ -492,6 +766,16 @@ class ComicAgent:
         page.bbox_error = bool(result.get("bbox_error", False))
         page.avg_ocr_confidence = None
         page.translation_consistent = True
+        page.auto_revision_done = False
+        page.auto_revision_changed = False
+        page.revision_mode_last = None
+        page.revision_warnings = []
+        page.revision_usage = None
+        page.erase_ok = False
+        page.erase_backend = None
+        page.erased_image_ref = None
+        page.rendered_image_ref = None
+        page.lettering_ok = False
         page.stage = PageStage.TRANSLATED
         page.needs_manual_rerun = False
 
@@ -704,7 +988,14 @@ class ComicAgent:
 
     def _do_translation(self, job: JobState, page: PageState, target_language: str, retry: bool) -> None:
         page.stage = PageStage.TRANSLATING
-        result = self.tools.run_translation(page, target_language=target_language)
+        retrieval = self.memory.build_translation_retrieval(job, page)
+        result = self.tools.run_translation(
+            page,
+            target_language=target_language,
+            page_context=str(retrieval.get("page_context") or ""),
+            glossary_entries=[x for x in (retrieval.get("glossary_hits") or []) if isinstance(x, dict)]
+            + [x for x in (retrieval.get("translation_memory_hits") or []) if isinstance(x, dict)],
+        )
 
         if not result["ok"]:
             page.stage = PageStage.FAILED
@@ -722,18 +1013,50 @@ class ComicAgent:
             region.stage = RegionStage.TRANSLATED
 
         page.translation_consistent = result.get("consistent", True)
+        page.auto_revision_done = False
+        page.auto_revision_changed = False
+        page.revision_mode_last = None
+        page.revision_warnings = []
+        page.revision_usage = None
+        page.erase_ok = False
+        page.erase_backend = None
+        page.erased_image_ref = None
         page.stage = PageStage.TRANSLATED
+        page.rendered_image_ref = None
+        page.lettering_ok = False
 
         self._log(job, f"Page {page.page_index}: translation done, consistent={page.translation_consistent}")
 
-    def _do_lettering(self, job: JobState, page: PageState, retry: bool) -> None:
-        page.stage = PageStage.LETTERING
-        result = self.tools.run_lettering(page)
+    def _do_erase(self, job: JobState, page: PageState, retry: bool, skill_params: Optional[Dict[str, Any]] = None) -> None:
+        page.stage = PageStage.ERASING
+        result = self.tools.run_erase(page, retry=retry, skill_params=skill_params)
 
         if not result["ok"]:
             page.stage = PageStage.FAILED
-            page.page_error_message = "Lettering failed."
-            self._log(job, f"Page {page.page_index}: lettering failed.")
+            page.page_error_message = "Erase failed."
+            page.erase_ok = False
+            if retry:
+                page.retry_count_erase += 1
+            self._log(job, f"Page {page.page_index}: erase failed.")
+            return
+
+        if retry:
+            page.retry_count_erase += 1
+
+        page.erase_ok = True
+        page.erase_backend = result.get("erase_backend")
+        page.stage = PageStage.ERASED
+        page.rendered_image_ref = None
+        self._log(job, f"Page {page.page_index}: erase done, backend={page.erase_backend}, params={skill_params or {}}")
+
+    def _do_typeset(self, job: JobState, page: PageState, retry: bool, skill_params: Optional[Dict[str, Any]] = None) -> None:
+        page.stage = PageStage.TYPESETTING
+        result = self.tools.run_typeset(page, skill_params=skill_params)
+
+        if not result["ok"]:
+            page.stage = PageStage.FAILED
+            page.page_error_message = "Typesetting failed."
+            self._log(job, f"Page {page.page_index}: typesetting failed.")
             return
 
         all_ok = True
@@ -751,9 +1074,9 @@ class ComicAgent:
                 all_ok = False
 
         page.lettering_ok = all_ok
-        page.stage = PageStage.LETTERING
+        page.stage = PageStage.TYPESETTING
 
-        self._log(job, f"Page {page.page_index}: lettering done, all_ok={all_ok}")
+        self._log(job, f"Page {page.page_index}: typesetting done, all_ok={all_ok}, params={skill_params or {}}")
 
     # -----------------------------------------------------
     # 工具：日志

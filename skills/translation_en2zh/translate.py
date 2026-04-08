@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from langchain_core.messages import SystemMessage, HumanMessage
-
-from orchestrator.llm_adapter import LLMConfig, build_chat_llm
+if TYPE_CHECKING:
+    from orchestrator.llm_adapter import LLMConfig
 
 
 @dataclass(frozen=True)
@@ -61,7 +60,7 @@ def translate_utterances_en2zh(
     utterances: List[Dict[str, Any]],
     page_context: str = "",
     glossary: Optional[List[GlossaryEntry]] = None,
-    llm_config: Optional[LLMConfig] = None,
+    llm_config: Optional["LLMConfig"] = None,
 ) -> Dict[str, Any]:
     """Translate a page's utterances EN->ZH.
 
@@ -80,6 +79,18 @@ def translate_utterances_en2zh(
     """
 
     glossary_ctx = build_glossary_context(utterances, glossary or [])
+
+    try:
+        from langchain_core.messages import SystemMessage, HumanMessage
+        from orchestrator.llm_adapter import build_chat_llm
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": {
+                "code": "missing_dependency",
+                "message": f"Missing translation dependencies (langchain). Install requirements to enable translation. Detail: {e}",
+            },
+        }
 
     system = SystemMessage(
         content=(

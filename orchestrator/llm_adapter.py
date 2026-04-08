@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-
-from langchain_openai import ChatOpenAI
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -22,7 +21,7 @@ class LLMConfig:
     api_key_env_fallback: str = "OPENAI_API_KEY"
 
 
-def build_chat_llm(config: LLMConfig | None = None) -> ChatOpenAI:
+def build_chat_llm(config: LLMConfig | None = None) -> Any:
     """Create a LangChain ChatOpenAI client configured for DashScope/Qwen.
 
     This follows the same configuration style as `test.py`:
@@ -34,9 +33,12 @@ def build_chat_llm(config: LLMConfig | None = None) -> ChatOpenAI:
     cfg = config or LLMConfig()
     api_key = os.getenv(cfg.api_key_env_primary) or os.getenv(cfg.api_key_env_fallback)
 
-    return ChatOpenAI(
-        model=cfg.model,
-        base_url=cfg.base_url,
-        api_key=api_key,
-        temperature=cfg.temperature,
-    )
+    try:
+        from langchain_openai import ChatOpenAI
+    except Exception as e:
+        raise RuntimeError(
+            "Missing dependency: langchain-openai. Install requirements to enable LLM features. "
+            f"Detail: {e}"
+        )
+
+    return ChatOpenAI(model=cfg.model, base_url=cfg.base_url, api_key=api_key, temperature=cfg.temperature)

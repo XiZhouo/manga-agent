@@ -190,6 +190,21 @@ def _scale_bbox_xywh(bbox_xywh: List[int], *, scale_x: float, scale_y: float, W:
     return [x2, y2, w2, h2]
 
 
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "boxed", "bubble", "caption", "narration"}:
+        return True
+    if text in {"false", "0", "no", "n", "embedded", "art", "art_integrated"}:
+        return False
+    return None
+
+
 def vlm_extract_translate_page(
     *,
     page_index: int,
@@ -197,6 +212,7 @@ def vlm_extract_translate_page(
     reading_direction: str = "ltr",
     source_language: str = "en",
     target_language: str = "zh",
+    retrieval_context: Optional[Dict[str, Any]] = None,
     config: Optional[VLMPageTranslateConfig] = None,
 ) -> Dict[str, Any]:
     """VLM core step: detect text regions + OCR + translate in one shot.
@@ -239,6 +255,11 @@ def vlm_extract_translate_page(
         "Return STRICT JSON only (no markdown, no commentary). "
         "Coordinates MUST be pixel coordinates on the image you see in this request. "
         "Prefer bbox format bbox_xywh=[x,y,w,h]. "
+        "You may receive retrieval_context with glossary/project/style hints from prior pages or user corrections. "
+        "Use those hints to improve translation consistency, especially locked terminology, but NEVER invent regions or OCR text not present in the image. "
+        "For each region, also decide has_text_box=true/false. "
+        "Use true when the text is inside a visible speech bubble, caption box, narration box, or another clear text container. "
+        "Use false when the text is embedded directly into artwork/background, such as titles, SFX, or art-integrated text with no clear container. "
         "Region ids must start from 1 and be stable within this page; order them in reading order. "
         "If no text is present, return an empty regions list."
     )
@@ -252,6 +273,7 @@ def vlm_extract_translate_page(
         "reading_direction": reading_direction,
         "source_language": source_language,
         "target_language": target_language,
+        "retrieval_context": retrieval_context or {},
         "output_schema": {
             "page_index": "int",
             "image_size": {"width": "int", "height": "int"},
@@ -259,6 +281,7 @@ def vlm_extract_translate_page(
                 {
                     "region_id": "int",
                     "bbox_xywh": "[int,int,int,int]",
+                    "has_text_box": "bool",
                     "src_text": "string",
                     "tgt_text": "string",
                     "utterance_order": "int (optional)"
@@ -334,6 +357,7 @@ def vlm_extract_translate_page(
 
             src_text = r.get("src_text") or r.get("text") or ""
             tgt_text = r.get("tgt_text") or r.get("translated_text") or ""
+            has_text_box = _coerce_optional_bool(r.get("has_text_box"))
             utterance_order = r.get("utterance_order")
             if utterance_order is not None:
                 try:
@@ -345,6 +369,7 @@ def vlm_extract_translate_page(
                 {
                     "region_id": region_id,
                     "bbox_xywh": bbox_xywh,
+                    "has_text_box": has_text_box,
                     "src_text": str(src_text),
                     "tgt_text": str(tgt_text),
                     "utterance_order": utterance_order,

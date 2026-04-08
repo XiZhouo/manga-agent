@@ -25,8 +25,14 @@ class DecisionEngine:
     MAX_RETRY_DETECTION = 2
     MAX_RETRY_OCR = 2
     MAX_RETRY_TRANSLATION = 1
+    MAX_RETRY_ERASE = 1
     MAX_RETRY_RENDER = 2
     MAX_RETRY_VLM = 1
+
+    def _skill_payload(self, page: PageState, skill_name: str) -> dict:
+        suggestions = getattr(page, "skill_param_suggestions", {}) or {}
+        params = suggestions.get(skill_name) if isinstance(suggestions, dict) else None
+        return {"skill_params": dict(params)} if isinstance(params, dict) and params else {}
 
     def decide_next_action(self, job: JobState) -> AgentAction:
         """
@@ -112,7 +118,8 @@ class DecisionEngine:
         """
         用户反馈该页效果不好时，决定从哪一步开始重跑。
         策略：
-        - 如果渲染有问题，从 lettering 重跑
+        - 如果嵌字有问题，从 typeset 重跑
+        - 否则如果擦除已有结果，优先只重跑 typeset
         - 否则如果翻译缺失，从 translation 重跑
         - 否则如果 OCR 置信度低，从 OCR 重跑
         - 否则从 detection 重跑
@@ -125,9 +132,18 @@ class DecisionEngine:
         )
         if any_render_bad:
             return AgentAction(
-                action_type=ActionType.RETRY_LETTERING,
+                action_type=ActionType.RETRY_TYPESET,
                 page_index=page.page_index,
-                reason="User requested rerun; lettering issue detected.",
+                payload=self._skill_payload(page, "lettering"),
+                reason="User requested rerun; typesetting issue detected.",
+            )
+
+        if page.erased_image_ref:
+            return AgentAction(
+                action_type=ActionType.RETRY_TYPESET,
+                page_index=page.page_index,
+                payload=self._skill_payload(page, "lettering"),
+                reason="User requested rerun; reuse erased page and rerun typeset only.",
             )
 
         if pipeline_mode == "vlm":
@@ -235,6 +251,19 @@ class DecisionEngine:
             )
 
         if page.stage == PageStage.TRANSLATED:
+            if not getattr(page, "auto_revision_done", False):
+                return AgentAction(
+                    action_type=ActionType.RUN_REVISION,
+                    page_index=page.page_index,
+                    payload={
+                        "revision_mode": "auto_rag_revision",
+                        "scope": "page_only",
+                        "reference_page_number": page.page_index + 1,
+                        "user_message": "Auto RAG consistency revision before erase.",
+                    },
+                    reason="Translation produced; run post-translation RAG self-check before erase.",
+                )
+
             pipeline_mode = str(job.user_preferences.get("pipeline_mode") or "classic").lower()
             if pipeline_mode == "vlm":
                 # 1) Judge can explicitly request user review.
@@ -307,12 +336,21 @@ class DecisionEngine:
                 )
 
             return AgentAction(
-                action_type=ActionType.RUN_LETTERING,
+                action_type=ActionType.RUN_ERASE,
                 page_index=page.page_index,
-                reason="Translation ok; proceed to lettering.",
+                payload=self._skill_payload(page, "lama_eraser"),
+                reason="Translation ok; proceed to erase original text.",
             )
 
-        if page.stage == PageStage.LETTERING:
+        if page.stage == PageStage.ERASED:
+            return AgentAction(
+                action_type=ActionType.RUN_TYPESET,
+                page_index=page.page_index,
+                payload=self._skill_payload(page, "lettering"),
+                reason="Erase ok; proceed to typesetting.",
+            )
+
+        if page.stage == PageStage.TYPESETTING:
             bad_render_regions = [
                 region for region in page.regions.values()
                 if (not region.render_ok) or region.render_overflow
@@ -324,14 +362,15 @@ class DecisionEngine:
                 )
                 if can_retry:
                     return AgentAction(
-                        action_type=ActionType.RETRY_LETTERING,
+                        action_type=ActionType.RETRY_TYPESET,
                         page_index=page.page_index,
-                        reason="Lettering overflow/bad render; retry lettering.",
+                        payload=self._skill_payload(page, "lettering"),
+                        reason="Typesetting overflow/bad render; retry typeset.",
                     )
                 return AgentAction(
                     action_type=ActionType.ASK_USER,
                     page_index=page.page_index,
-                    reason="Lettering failed after retries; ask user.",
+                    reason="Typesetting failed after retries; ask user.",
                 )
 
             page.stage = PageStage.DONE
@@ -339,6 +378,28 @@ class DecisionEngine:
                 action_type=ActionType.NO_OP,
                 page_index=page.page_index,
                 reason="Page marked done.",
+            )
+
+        if page.stage == PageStage.ERASING:
+            if page.erase_ok and page.erased_image_ref:
+                return AgentAction(
+                    action_type=ActionType.RUN_TYPESET,
+                    page_index=page.page_index,
+                    payload=self._skill_payload(page, "lettering"),
+                    reason="Erase completed; proceed to typesetting.",
+                )
+
+            if page.retry_count_erase < self.MAX_RETRY_ERASE:
+                return AgentAction(
+                    action_type=ActionType.RETRY_ERASE,
+                    page_index=page.page_index,
+                    payload=self._skill_payload(page, "lama_eraser"),
+                    reason="Erase did not finish cleanly; retry erase.",
+                )
+            return AgentAction(
+                action_type=ActionType.ASK_USER,
+                page_index=page.page_index,
+                reason="Erase failed after retries; ask user.",
             )
 
         if page.stage in [PageStage.DONE, PageStage.FAILED]:

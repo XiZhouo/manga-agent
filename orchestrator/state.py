@@ -22,7 +22,10 @@ class PageStage(str, Enum):
     OCR_DONE = "ocr_done"
     TRANSLATING = "translating"
     TRANSLATED = "translated"
-    LETTERING = "lettering"
+    REVISING = "revising"
+    ERASING = "erasing"
+    ERASED = "erased"
+    TYPESETTING = "typesetting"
     DONE = "done"
     FAILED = "failed"
 
@@ -41,13 +44,15 @@ class ActionType(str, Enum):
     RUN_TRANSLATION = "run_translation"
     RUN_VLM_PAGE = "run_vlm_page"
     RUN_REVISION = "run_revision"
-    RUN_LETTERING = "run_lettering"
+    RUN_ERASE = "run_erase"
+    RUN_TYPESET = "run_typeset"
 
     RETRY_DETECTION = "retry_detection"
     RETRY_OCR = "retry_ocr"
     RETRY_TRANSLATION = "retry_translation"
     RETRY_VLM_PAGE = "retry_vlm_page"
-    RETRY_LETTERING = "retry_lettering"
+    RETRY_ERASE = "retry_erase"
+    RETRY_TYPESET = "retry_typeset"
 
     ASK_USER = "ask_user"
     FINISH_JOB = "finish_job"
@@ -64,6 +69,7 @@ class RegionState:
     region_id: int
     bbox: Optional[List[int]] = None  # [x, y, w, h]
     region_type: str = "text"
+    has_text_box: Optional[bool] = None
 
     ocr_text: Optional[str] = None
     ocr_confidence: Optional[float] = None
@@ -90,9 +96,12 @@ class PageState:
     page_index: int
     source_filename: Optional[str] = None
     image_ref: Optional[str] = None  # 文件路径、对象存储 key、数据库引用等
+    erased_image_ref: Optional[str] = None  # path to inpainted page image (if available)
+    rendered_image_ref: Optional[str] = None  # path to rendered page image (if available)
 
     stage: PageStage = PageStage.NOT_STARTED
     regions: Dict[int, RegionState] = field(default_factory=dict)
+    skill_param_suggestions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # 页面级质量指标
     detection_ok: bool = False
@@ -120,9 +129,17 @@ class PageState:
 
     avg_ocr_confidence: Optional[float] = None
     translation_consistent: bool = True
+    auto_revision_done: bool = False
+    auto_revision_changed: bool = False
+    revision_mode_last: Optional[str] = None
+    revision_warnings: List[str] = field(default_factory=list)
+    revision_usage: Optional[Dict[str, Any]] = None
+    erase_ok: bool = False
+    erase_backend: Optional[str] = None
     lettering_ok: bool = False
 
     retry_count_detection: int = 0
+    retry_count_erase: int = 0
     page_error_message: Optional[str] = None
 
     # 用户是否手动要求重跑这一页

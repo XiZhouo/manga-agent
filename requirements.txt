@@ -30,3 +30,12 @@ tiktoken
 pyyaml
 requests
 tqdm
+
+# Local HTTP services
+fastapi
+uvicorn
+pydantic
+
+# Optional real LaMa runner on the erase server
+# If unavailable, the server can still run with OpenCV fallback.
+simple-lama-inpainting
