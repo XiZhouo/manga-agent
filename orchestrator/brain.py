@@ -212,9 +212,12 @@ class DecisionBrain:
                 "apply_glossary": "bool",
                 "strategy_suggestions": {
                     "preferred_rerun_action": "retry_typeset|retry_erase|retry_vlm_page|retry_translation|retry_ocr|retry_detection|run_revision",
+                    "preferred_correction_action": "run_revision|retry_vlm_page|retry_translation|retry_ocr|retry_detection",
+                    "preferred_post_translation_action": "auto_revision_then_erase|erase_direct",
                     "revision_scope": "page_only|global",
                     "revision_page_limit": "int_1_to_24",
-                    "reuse_erased_image": "bool"
+                    "reuse_erased_image": "bool",
+                    "page_profile": "default|art_integrated|boxed_dialogue"
                 },
                 "skill_param_suggestions": {
                     "lama_eraser": {"profile": "enum?", "mask_dilate_px": "int?"},

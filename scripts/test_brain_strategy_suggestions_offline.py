@@ -12,6 +12,24 @@ from orchestrator.tools import Tools
 
 class StrategyBrain:
     def plan_user_message(self, *, user_message: str, page_count: int, pipeline_mode: str, target_language: str, brain_context=None, skill_context=None):
+        if "艺术字" in user_message:
+            return {
+                "intent": "preference",
+                "needs_clarification": False,
+                "clarifying_question": None,
+                "reference_page_number": 1,
+                "scope": "page_only",
+                "from_side": "auto",
+                "from_text": None,
+                "to_text": None,
+                "glossary_type": None,
+                "apply_glossary": False,
+                "strategy_suggestions": {
+                    "page_profile": "art_integrated",
+                    "preferred_post_translation_action": "erase_direct",
+                },
+                "confidence": 0.9,
+            }
         if "重跑" in user_message:
             return {
                 "intent": "rerun_page",
@@ -29,6 +47,23 @@ class StrategyBrain:
                     "reuse_erased_image": True,
                 },
                 "confidence": 0.91,
+            }
+        if "整页重翻" in user_message:
+            return {
+                "intent": "correction",
+                "needs_clarification": False,
+                "clarifying_question": None,
+                "reference_page_number": 1,
+                "scope": "page_only",
+                "from_side": "auto",
+                "from_text": None,
+                "to_text": None,
+                "glossary_type": None,
+                "apply_glossary": False,
+                "strategy_suggestions": {
+                    "preferred_correction_action": "retry_vlm_page",
+                },
+                "confidence": 0.89,
             }
 
         return {
@@ -54,6 +89,7 @@ class StrategyTools(Tools):
     def __init__(self) -> None:
         super().__init__()
         self.last_revision_pages = None
+        self.auto_revision_calls = 0
 
     def run_vlm_page(self, page, **kw):
         return {
@@ -79,6 +115,8 @@ class StrategyTools(Tools):
         }
 
     def run_vlm_translation_revision(self, **kwargs):
+        if kwargs.get("revision_mode") == "auto_rag_revision":
+            self.auto_revision_calls += 1
         self.last_revision_pages = len(kwargs["pages"])
         pages = kwargs["pages"]
         revised = []
@@ -140,8 +178,20 @@ def main() -> None:
         job.user_preferences["pipeline_mode"] = "vlm"
         store.save_job(job)
 
+        agent.handle_user_message(job_id, "第1页是艺术字页，先直接擦除再嵌字")
+        job = store.get_job(job_id)
+        plan = job.pending_user_plan
+        print("pending_after_preference=", plan)
+        assert plan is None
+        assert job.pages[0].strategy_suggestions.get("page_profile") == "art_integrated"
+        assert job.pages[0].strategy_suggestions.get("preferred_post_translation_action") == "erase_direct"
+        assert job.pages[0].skill_param_suggestions.get("lama_eraser", {}).get("profile") == "aggressive"
+        assert job.pages[0].skill_param_suggestions.get("lettering", {}).get("render_mode") == "art_embed"
+
         job = agent.run_until_waiting_or_done(job_id, max_steps=30)
         assert job.status.value == "completed"
+        print("auto_revision_calls=", tools.auto_revision_calls)
+        assert tools.auto_revision_calls == 2
 
         agent.handle_user_message(job_id, "第1页的 echo 应该统一一下")
         job = store.get_job(job_id)
@@ -153,6 +203,15 @@ def main() -> None:
         job = agent.run_until_waiting_or_done(job_id, max_steps=20)
         print("revision_pages_used=", tools.last_revision_pages)
         assert tools.last_revision_pages == 1
+
+        agent.handle_user_message(job_id, "第1页整页重翻一下")
+        job = store.get_job(job_id)
+        plan = job.pending_user_plan or {}
+        print("strategy_after_full_rerun_correction=", plan.get("strategy_suggestions"))
+        action = engine.decide_next_action(job)
+        print("correction_action=", action.action_type.value)
+        assert (plan.get("strategy_suggestions") or {}).get("preferred_correction_action") == "retry_vlm_page"
+        assert action.action_type.value == "retry_vlm_page", action
 
         job = store.get_job(job_id)
         page0 = job.pages[0]

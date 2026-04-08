@@ -107,6 +107,55 @@ class DecisionEngine:
 
         return None
 
+    def _guard_brain_correction_action(self, job: JobState, page: PageState, plan: dict) -> AgentAction | None:
+        strategy = self._strategy_for_plan(plan)
+        preferred = str(strategy.get("preferred_correction_action") or "").strip().lower()
+        if not preferred:
+            return None
+
+        if preferred == "run_revision":
+            return AgentAction(
+                action_type=ActionType.RUN_REVISION,
+                page_index=page.page_index,
+                payload=plan,
+                reason="Brain suggested text-only revision for this correction.",
+            )
+
+        if preferred == "retry_vlm_page":
+            pipeline_mode = str(job.user_preferences.get("pipeline_mode") or "classic").lower()
+            if pipeline_mode == "vlm":
+                return AgentAction(
+                    action_type=ActionType.RETRY_VLM_PAGE,
+                    page_index=page.page_index,
+                    payload={"target_language": job.target_language},
+                    reason="Brain suggested rerunning the VLM core for this correction.",
+                )
+            return None
+
+        if preferred == "retry_translation" and page.regions:
+            return AgentAction(
+                action_type=ActionType.RETRY_TRANSLATION,
+                page_index=page.page_index,
+                payload={"target_language": job.target_language},
+                reason="Brain suggested rerunning translation for this correction.",
+            )
+
+        if preferred == "retry_ocr" and page.regions:
+            return AgentAction(
+                action_type=ActionType.RETRY_OCR,
+                page_index=page.page_index,
+                reason="Brain suggested rerunning OCR for this correction.",
+            )
+
+        if preferred == "retry_detection":
+            return AgentAction(
+                action_type=ActionType.RETRY_DETECTION,
+                page_index=page.page_index,
+                reason="Brain suggested rerunning detection for this correction.",
+            )
+
+        return None
+
     def decide_next_action(self, job: JobState) -> AgentAction:
         """
         根据整个 JobState 决定下一步动作。
@@ -171,6 +220,9 @@ class DecisionEngine:
             page_index = sorted(job.pages.keys())[0] if job.pages else 0
 
         if intent == "correction":
+            guarded = self._guard_brain_correction_action(job, job.pages[page_index], plan) if page_index in job.pages else None
+            if guarded is not None:
+                return guarded
             return AgentAction(
                 action_type=ActionType.RUN_REVISION,
                 page_index=page_index,
@@ -327,6 +379,7 @@ class DecisionEngine:
             )
 
         if page.stage == PageStage.TRANSLATED:
+            page_strategy = getattr(page, "strategy_suggestions", {}) or {}
             pipeline_mode = str(job.user_preferences.get("pipeline_mode") or "classic").lower()
             if pipeline_mode == "vlm":
                 # 1) Judge can explicitly request user review.
@@ -398,7 +451,8 @@ class DecisionEngine:
                     reason="Translation still inconsistent; ask user.",
                 )
 
-            if not getattr(page, "auto_revision_done", False):
+            post_translation_action = str(page_strategy.get("preferred_post_translation_action") or "auto_revision_then_erase").strip().lower()
+            if post_translation_action != "erase_direct" and not getattr(page, "auto_revision_done", False):
                 return AgentAction(
                     action_type=ActionType.RUN_REVISION,
                     page_index=page.page_index,

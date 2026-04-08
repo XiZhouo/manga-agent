@@ -143,6 +143,21 @@ def sanitize_strategy_suggestions(raw: Optional[Dict[str, Any]]) -> Dict[str, An
     if str(preferred_action or "").strip().lower() in allowed_actions:
         out["preferred_rerun_action"] = str(preferred_action).strip().lower()
 
+    preferred_correction = raw.get("preferred_correction_action")
+    allowed_correction_actions = {
+        "run_revision",
+        "retry_vlm_page",
+        "retry_translation",
+        "retry_ocr",
+        "retry_detection",
+    }
+    if str(preferred_correction or "").strip().lower() in allowed_correction_actions:
+        out["preferred_correction_action"] = str(preferred_correction).strip().lower()
+
+    post_translation_action = raw.get("preferred_post_translation_action")
+    if str(post_translation_action or "").strip().lower() in {"auto_revision_then_erase", "erase_direct"}:
+        out["preferred_post_translation_action"] = str(post_translation_action).strip().lower()
+
     revision_scope = raw.get("revision_scope")
     if str(revision_scope or "").strip().lower() in {"page_only", "global"}:
         out["revision_scope"] = str(revision_scope).strip().lower()
@@ -164,5 +179,9 @@ def sanitize_strategy_suggestions(raw: Optional[Dict[str, Any]]) -> Dict[str, An
             out["reuse_erased_image"] = True
         elif text in {"false", "0", "no"}:
             out["reuse_erased_image"] = False
+
+    page_profile = raw.get("page_profile")
+    if str(page_profile or "").strip().lower() in {"default", "art_integrated", "boxed_dialogue"}:
+        out["page_profile"] = str(page_profile).strip().lower()
 
     return out

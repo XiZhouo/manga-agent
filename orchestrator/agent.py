@@ -273,37 +273,59 @@ class ComicAgent:
 
         return selected or [ref_page_index]
 
+    def _target_pages_for_plan(self, job: JobState, plan: Dict[str, Any]) -> List[int]:
+        page_index = self._resolve_plan_page_index(job, plan)
+        scope = str(plan.get("scope") or "page_only").strip().lower()
+        if scope == "global":
+            return sorted(job.pages.keys())
+        if page_index is not None and page_index in job.pages:
+            return [page_index]
+        return [sorted(job.pages.keys())[0]] if job.pages else []
+
+    def _merge_page_skill_params(self, page: PageState, skill_name: str, params: Dict[str, Any]) -> None:
+        merged = dict(page.skill_param_suggestions or {})
+        prev = merged.get(skill_name) or {}
+        merged[skill_name] = {**prev, **params}
+        page.skill_param_suggestions = merged
+
+    def _apply_page_profile_presets(self, page: PageState, profile: str) -> None:
+        profile_norm = str(profile or "").strip().lower()
+        if profile_norm == "art_integrated":
+            self._merge_page_skill_params(page, "lama_eraser", {"profile": "aggressive", "mask_dilate_px": 4})
+            self._merge_page_skill_params(page, "lettering", {"render_mode": "art_embed", "padding_ratio": 0.06, "stroke_width": 3})
+        elif profile_norm == "boxed_dialogue":
+            self._merge_page_skill_params(page, "lama_eraser", {"profile": "balanced", "mask_dilate_px": 2})
+            self._merge_page_skill_params(page, "lettering", {"render_mode": "bubble_fit", "padding_ratio": 0.08, "stroke_width": 2})
+
     def _apply_skill_suggestions_from_plan(self, job: JobState, plan: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         clean = sanitize_skill_param_suggestions(plan.get("skill_param_suggestions"))
         if not clean:
             return {}
 
-        page_index = self._resolve_plan_page_index(job, plan)
-        scope = str(plan.get("scope") or "page_only").strip().lower()
-        target_pages: List[int]
-        if scope == "global":
-            target_pages = sorted(job.pages.keys())
-        elif page_index is not None and page_index in job.pages:
-            target_pages = [page_index]
-        else:
-            target_pages = [sorted(job.pages.keys())[0]] if job.pages else []
+        target_pages = self._target_pages_for_plan(job, plan)
 
         for pi in target_pages:
             page = job.pages[pi]
-            merged = dict(page.skill_param_suggestions or {})
             for skill_name, params in clean.items():
-                prev = merged.get(skill_name) or {}
-                merged[skill_name] = {**prev, **params}
-            page.skill_param_suggestions = merged
+                self._merge_page_skill_params(page, skill_name, params)
         return clean
 
-    def _apply_strategy_suggestions_from_plan(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+    def _apply_strategy_suggestions_from_plan(self, job: JobState, plan: Dict[str, Any]) -> Dict[str, Any]:
         clean = sanitize_strategy_suggestions(plan.get("strategy_suggestions"))
         if not clean:
             return {}
 
         if clean.get("revision_scope") in {"page_only", "global"}:
             plan["scope"] = clean["revision_scope"]
+
+        for pi in self._target_pages_for_plan(job, plan):
+            page = job.pages[pi]
+            merged = dict(page.strategy_suggestions or {})
+            merged.update(clean)
+            page.strategy_suggestions = merged
+            profile = clean.get("page_profile")
+            if isinstance(profile, str) and profile:
+                self._apply_page_profile_presets(page, profile)
         return clean
 
     # -----------------------------------------------------
@@ -390,11 +412,15 @@ class ComicAgent:
             )
             if isinstance(plan, dict) and plan:
                 plan.setdefault("user_message", user_message)
+                clean_strategy = self._apply_strategy_suggestions_from_plan(job, plan)
                 clean_suggestions = self._apply_skill_suggestions_from_plan(job, plan)
-                clean_strategy = self._apply_strategy_suggestions_from_plan(plan)
                 plan["skill_param_suggestions"] = clean_suggestions
                 plan["strategy_suggestions"] = clean_strategy
-                job.pending_user_plan = plan
+                intent = str(plan.get("intent") or "unknown").strip().lower()
+                if intent in {"correction", "rerun_page"} or bool(plan.get("needs_clarification")):
+                    job.pending_user_plan = plan
+                else:
+                    job.pending_user_plan = None
                 job.logs.append(f"Brain plan: intent={plan.get('intent')} scope={plan.get('scope')} ref={plan.get('reference_page_number')} conf={plan.get('confidence')}")
                 self.memory.record_brain_event(job, user_message=user_message, plan=plan)
         except Exception as e:

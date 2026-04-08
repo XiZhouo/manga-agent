@@ -102,6 +102,7 @@ class PageState:
     stage: PageStage = PageStage.NOT_STARTED
     regions: Dict[int, RegionState] = field(default_factory=dict)
     skill_param_suggestions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    strategy_suggestions: Dict[str, Any] = field(default_factory=dict)
 
     # 页面级质量指标
     detection_ok: bool = False

@@ -105,6 +105,7 @@ def _build_run_manifest(job_state) -> Dict[str, Any]:
                 "erased_image_ref": getattr(page, "erased_image_ref", None),
                 "rendered_image_ref": getattr(page, "rendered_image_ref", None),
                 "skill_param_suggestions": getattr(page, "skill_param_suggestions", None),
+                "strategy_suggestions": getattr(page, "strategy_suggestions", None),
                 "stage": page.stage.value,
                 "vlm": {
                     "quality_ok": getattr(page, "vlm_quality_ok", None),
