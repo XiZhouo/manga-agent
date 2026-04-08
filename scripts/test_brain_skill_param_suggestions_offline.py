@@ -4,8 +4,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PIL import Image
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from orchestrator import ComicAgent, DecisionEngine, InMemoryStateStore
@@ -100,7 +98,7 @@ class SuggestionTools(Tools):
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="agent1_brain_params_") as td:
         img_path = Path(td) / "page.png"
-        Image.new("RGB", (100, 100), (255, 255, 255)).save(img_path)
+        img_path.write_bytes(b"stub")
 
         store = InMemoryStateStore()
         tools = SuggestionTools()

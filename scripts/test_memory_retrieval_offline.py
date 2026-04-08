@@ -162,6 +162,7 @@ def main() -> None:
         tm = json.loads(tm_path.read_text(encoding="utf-8"))
         entries = tm.get("entries") or []
         print("translation_memory_entries=", len(entries))
+        assert len(entries) == 1
         assert any(e.get("src_text") == "May the Force be with you" and e.get("tgt_text") == "原力与你同在" for e in entries)
 
         brain_mem_path = job_dir / "memory" / "brain_memory.json"

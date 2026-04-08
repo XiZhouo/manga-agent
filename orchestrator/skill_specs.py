@@ -122,3 +122,47 @@ def sanitize_skill_param_suggestions(raw: Optional[Dict[str, Any]]) -> Dict[str,
         if clean:
             out[skill_name] = clean
     return out
+
+
+def sanitize_strategy_suggestions(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+
+    out: Dict[str, Any] = {}
+
+    preferred_action = raw.get("preferred_rerun_action")
+    allowed_actions = {
+        "retry_typeset",
+        "retry_erase",
+        "retry_vlm_page",
+        "retry_translation",
+        "retry_ocr",
+        "retry_detection",
+        "run_revision",
+    }
+    if str(preferred_action or "").strip().lower() in allowed_actions:
+        out["preferred_rerun_action"] = str(preferred_action).strip().lower()
+
+    revision_scope = raw.get("revision_scope")
+    if str(revision_scope or "").strip().lower() in {"page_only", "global"}:
+        out["revision_scope"] = str(revision_scope).strip().lower()
+
+    revision_page_limit = raw.get("revision_page_limit")
+    try:
+        if revision_page_limit is not None:
+            limit = int(revision_page_limit)
+            out["revision_page_limit"] = max(1, min(24, limit))
+    except Exception:
+        pass
+
+    reuse_erased = raw.get("reuse_erased_image")
+    if isinstance(reuse_erased, bool):
+        out["reuse_erased_image"] = reuse_erased
+    elif isinstance(reuse_erased, str):
+        text = reuse_erased.strip().lower()
+        if text in {"true", "1", "yes"}:
+            out["reuse_erased_image"] = True
+        elif text in {"false", "0", "no"}:
+            out["reuse_erased_image"] = False
+
+    return out

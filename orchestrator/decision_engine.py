@@ -29,10 +29,83 @@ class DecisionEngine:
     MAX_RETRY_RENDER = 2
     MAX_RETRY_VLM = 1
 
+    def _strategy_for_plan(self, plan: dict) -> dict:
+        strategy = plan.get("strategy_suggestions")
+        return strategy if isinstance(strategy, dict) else {}
+
     def _skill_payload(self, page: PageState, skill_name: str) -> dict:
         suggestions = getattr(page, "skill_param_suggestions", {}) or {}
         params = suggestions.get(skill_name) if isinstance(suggestions, dict) else None
         return {"skill_params": dict(params)} if isinstance(params, dict) and params else {}
+
+    def _guard_brain_rerun_action(self, job: JobState, page: PageState, plan: dict) -> AgentAction | None:
+        strategy = self._strategy_for_plan(plan)
+        preferred = str(strategy.get("preferred_rerun_action") or "").strip().lower()
+        if not preferred:
+            return None
+
+        if preferred == "retry_typeset":
+            if page.erased_image_ref or page.rendered_image_ref or page.stage in {PageStage.ERASED, PageStage.TYPESETTING, PageStage.DONE}:
+                return AgentAction(
+                    action_type=ActionType.RETRY_TYPESET,
+                    page_index=page.page_index,
+                    payload=self._skill_payload(page, "lettering"),
+                    reason="Brain suggested re-typesetting as the safest rerun path.",
+                )
+            return None
+
+        if preferred == "retry_erase":
+            if page.regions:
+                return AgentAction(
+                    action_type=ActionType.RETRY_ERASE,
+                    page_index=page.page_index,
+                    payload=self._skill_payload(page, "lama_eraser"),
+                    reason="Brain suggested re-erasing before re-typesetting.",
+                )
+            return None
+
+        if preferred == "retry_vlm_page":
+            pipeline_mode = str(job.user_preferences.get("pipeline_mode") or "classic").lower()
+            if pipeline_mode == "vlm":
+                return AgentAction(
+                    action_type=ActionType.RETRY_VLM_PAGE,
+                    page_index=page.page_index,
+                    payload={"target_language": job.target_language},
+                    reason="Brain suggested rerunning the VLM core.",
+                )
+            return None
+
+        if preferred == "retry_translation" and page.regions:
+            return AgentAction(
+                action_type=ActionType.RETRY_TRANSLATION,
+                page_index=page.page_index,
+                payload={"target_language": job.target_language},
+                reason="Brain suggested rerunning text translation.",
+            )
+
+        if preferred == "retry_ocr" and page.regions:
+            return AgentAction(
+                action_type=ActionType.RETRY_OCR,
+                page_index=page.page_index,
+                reason="Brain suggested rerunning OCR.",
+            )
+
+        if preferred == "retry_detection":
+            return AgentAction(
+                action_type=ActionType.RETRY_DETECTION,
+                page_index=page.page_index,
+                reason="Brain suggested rerunning detection.",
+            )
+
+        if preferred == "run_revision" and page.regions:
+            return AgentAction(
+                action_type=ActionType.RUN_REVISION,
+                page_index=page.page_index,
+                payload=plan,
+                reason="Brain suggested text-only revision instead of a heavier rerun.",
+            )
+
+        return None
 
     def decide_next_action(self, job: JobState) -> AgentAction:
         """
@@ -108,6 +181,9 @@ class DecisionEngine:
         if intent == "rerun_page":
             # Reuse existing rerun policy.
             if page_index in job.pages:
+                guarded = self._guard_brain_rerun_action(job, job.pages[page_index], plan)
+                if guarded is not None:
+                    return guarded
                 return self._decide_rerun_for_page(job.pages[page_index], job)
             return AgentAction(ActionType.ASK_USER, reason="Requested rerun page not found; please provide a valid page number.")
 
@@ -251,19 +327,6 @@ class DecisionEngine:
             )
 
         if page.stage == PageStage.TRANSLATED:
-            if not getattr(page, "auto_revision_done", False):
-                return AgentAction(
-                    action_type=ActionType.RUN_REVISION,
-                    page_index=page.page_index,
-                    payload={
-                        "revision_mode": "auto_rag_revision",
-                        "scope": "page_only",
-                        "reference_page_number": page.page_index + 1,
-                        "user_message": "Auto RAG consistency revision before erase.",
-                    },
-                    reason="Translation produced; run post-translation RAG self-check before erase.",
-                )
-
             pipeline_mode = str(job.user_preferences.get("pipeline_mode") or "classic").lower()
             if pipeline_mode == "vlm":
                 # 1) Judge can explicitly request user review.
@@ -333,6 +396,19 @@ class DecisionEngine:
                     action_type=ActionType.ASK_USER,
                     page_index=page.page_index,
                     reason="Translation still inconsistent; ask user.",
+                )
+
+            if not getattr(page, "auto_revision_done", False):
+                return AgentAction(
+                    action_type=ActionType.RUN_REVISION,
+                    page_index=page.page_index,
+                    payload={
+                        "revision_mode": "auto_rag_revision",
+                        "scope": "page_only",
+                        "reference_page_number": page.page_index + 1,
+                        "user_message": "Auto RAG consistency revision before erase.",
+                    },
+                    reason="Translation produced; run post-translation RAG self-check before erase.",
                 )
 
             return AgentAction(

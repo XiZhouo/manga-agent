@@ -49,11 +49,13 @@ class OfflineRevisionTools(Tools):
         self.vlm_calls = 0
         self.auto_revision_calls = 0
         self.user_revision_calls = 0
+        self.user_revision_candidate_pages = None
         self.lettering_calls = 0
 
     def run_vlm_page(self, page, **kw):
         self.vlm_calls += 1
-        if int(getattr(page, "page_index", 0)) == 1:
+        page_index = int(getattr(page, "page_index", 0))
+        if page_index == 1:
             return {
                 "ok": True,
                 "regions": [
@@ -68,6 +70,21 @@ class OfflineRevisionTools(Tools):
                     "usage": {"total_tokens": 111},
                 },
                 "raw": {"ok": True, "metrics": {"regions": 2}},
+            }
+        if page_index == 2:
+            return {
+                "ok": True,
+                "regions": [
+                    {"region_id": 1, "bbox": [10, 10, 100, 40], "region_type": "text", "src_text": "Goodbye", "tgt_text": "再见"},
+                ],
+                "bbox_error": False,
+                "vlm_metrics": {
+                    "orig": (1988, 3057),
+                    "sent": (1988, 3057),
+                    "downscaled": False,
+                    "usage": {"total_tokens": 111},
+                },
+                "raw": {"ok": True, "metrics": {"regions": 1}},
             }
 
         return {
@@ -127,6 +144,7 @@ class OfflineRevisionTools(Tools):
                 revised.append(p2)
         else:
             self.user_revision_calls += 1
+            self.user_revision_candidate_pages = len(pages)
             for p in pages:
                 p2 = {"page_index": int(p.get("page_index")), "regions": []}
                 for r in p.get("regions") or []:
@@ -187,7 +205,7 @@ def main() -> None:
         user_id="test",
         source_file_name="dummy",
         target_language="zh",
-        pages=[(0, "missing0.png"), (1, "missing1.png")],
+        pages=[(0, "missing0.png"), (1, "missing1.png"), (2, "missing2.png")],
     )
 
     job = store.get_job(job_id)
@@ -209,8 +227,10 @@ def main() -> None:
     )
     print("tgt_after_auto_p1=", job.pages[0].regions[1].translated_text)
     print("tgt_after_auto_p2=", job.pages[1].regions[1].translated_text)
+    print("tgt_after_auto_p3=", job.pages[2].regions[1].translated_text)
     assert job.pages[0].regions[1].translated_text == "原力与你同在"
-    assert tools.auto_revision_calls >= 2
+    assert job.pages[2].regions[1].translated_text == "再见"
+    assert tools.auto_revision_calls >= 3
 
     # User correction
     agent.handle_user_message(job_id, "第1页的 World 应该翻译成 天下，请修改所有相关的问题")
@@ -236,10 +256,14 @@ def main() -> None:
     )
     print("tgt_after_user_p1_r2=", job.pages[0].regions[2].translated_text)
     print("tgt_after_user_p2_r2=", job.pages[1].regions[2].translated_text)
+    print("user_revision_candidate_pages=", tools.user_revision_candidate_pages)
     print("glossary_entries=", len((job.glossary or {}).get("entries") or []))
     assert job.pages[0].regions[2].translated_text == "天下"
     assert job.pages[1].regions[2].translated_text == "天下"
+    assert job.pages[2].regions[1].translated_text == "再见"
+    assert tools.user_revision_candidate_pages == 2
     assert tools.user_revision_calls == 1
+    assert len((job.glossary or {}).get("entries") or []) == 1
     print("tail_logs=")
     for line in job.logs[-12:]:
         print(" ", line)

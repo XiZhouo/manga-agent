@@ -210,6 +210,12 @@ class DecisionBrain:
                 "to_text": "string|null",
                 "glossary_type": "term|quote|name|phrase|null",
                 "apply_glossary": "bool",
+                "strategy_suggestions": {
+                    "preferred_rerun_action": "retry_typeset|retry_erase|retry_vlm_page|retry_translation|retry_ocr|retry_detection|run_revision",
+                    "revision_scope": "page_only|global",
+                    "revision_page_limit": "int_1_to_24",
+                    "reuse_erased_image": "bool"
+                },
                 "skill_param_suggestions": {
                     "lama_eraser": {"profile": "enum?", "mask_dilate_px": "int?"},
                     "lettering": {
@@ -280,6 +286,9 @@ class DecisionBrain:
             to_text = None
 
         apply_glossary = bool(data.get("apply_glossary"))
+        strategy_suggestions = data.get("strategy_suggestions")
+        if not isinstance(strategy_suggestions, dict):
+            strategy_suggestions = {}
         skill_param_suggestions = data.get("skill_param_suggestions")
         if not isinstance(skill_param_suggestions, dict):
             skill_param_suggestions = {}
@@ -301,6 +310,7 @@ class DecisionBrain:
             "to_text": to_text,
             "glossary_type": glossary_type,
             "apply_glossary": apply_glossary,
+            "strategy_suggestions": strategy_suggestions,
             "skill_param_suggestions": skill_param_suggestions,
             "confidence": conf,
         }

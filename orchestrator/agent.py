@@ -5,6 +5,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from typing import Optional, Tuple, List, Any, Dict
 
 from .state import (
@@ -23,7 +24,7 @@ from .tools import Tools
 from .brain import DecisionBrain
 from .memory_store import LocalMemoryStore, utc_iso
 from .retrieval import RetrievalContextBuilder
-from .skill_specs import build_skill_context_for_brain, sanitize_skill_param_suggestions
+from .skill_specs import build_skill_context_for_brain, sanitize_skill_param_suggestions, sanitize_strategy_suggestions
 
 
 class SimpleMemory:
@@ -209,6 +210,69 @@ class ComicAgent:
                 page_index = ref_num
         return page_index
 
+    def _revision_query_matches(self, *, query: str, from_side: str, region: RegionState) -> bool:
+        q = " ".join(str(query or "").strip().lower().split())
+        if not q:
+            return False
+
+        src = " ".join(str(region.ocr_text or "").strip().lower().split())
+        tgt = " ".join(str(region.translated_text or "").strip().lower().split())
+        haystacks = []
+        if from_side == "src":
+            haystacks = [src]
+        elif from_side == "tgt":
+            haystacks = [tgt]
+        else:
+            haystacks = [src, tgt]
+
+        for text in haystacks:
+            if not text:
+                continue
+            if q == text or q in text or text in q:
+                return True
+            if SequenceMatcher(None, q, text).ratio() >= 0.92:
+                return True
+        return False
+
+    def _select_revision_target_pages(self, job: JobState, action: AgentAction, plan: Dict[str, Any], revision_mode: str) -> List[int]:
+        if revision_mode == "auto_rag_revision":
+            return [action.page_index]
+
+        strategy = plan.get("strategy_suggestions") if isinstance(plan.get("strategy_suggestions"), dict) else {}
+        scope = str((strategy or {}).get("revision_scope") or plan.get("scope") or "page_only").strip().lower()
+        ref_page_index = self._resolve_plan_page_index(job, plan)
+        if ref_page_index is None:
+            ref_page_index = action.page_index
+
+        if scope != "global":
+            return [ref_page_index]
+
+        query = str(plan.get("from_text") or "").strip()
+        from_side = str(plan.get("from_side") or "auto").strip().lower()
+        selected: List[int] = []
+        if ref_page_index in job.pages:
+            selected.append(ref_page_index)
+
+        for page_index in sorted(job.pages.keys()):
+            if page_index == ref_page_index:
+                continue
+            if not query:
+                continue
+            page = job.pages[page_index]
+            if any(self._revision_query_matches(query=query, from_side=from_side, region=region) for region in page.regions.values()):
+                selected.append(page_index)
+
+        env_limit = max(1, int(os.getenv("MANGA_AGENT_REVISION_PRESELECT_PAGES", "24")))
+        suggested_limit = (strategy or {}).get("revision_page_limit")
+        try:
+            max_pages = min(env_limit, max(1, int(suggested_limit))) if suggested_limit is not None else env_limit
+        except Exception:
+            max_pages = env_limit
+        if len(selected) > max_pages:
+            selected = selected[:max_pages]
+
+        return selected or [ref_page_index]
+
     def _apply_skill_suggestions_from_plan(self, job: JobState, plan: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         clean = sanitize_skill_param_suggestions(plan.get("skill_param_suggestions"))
         if not clean:
@@ -231,6 +295,15 @@ class ComicAgent:
                 prev = merged.get(skill_name) or {}
                 merged[skill_name] = {**prev, **params}
             page.skill_param_suggestions = merged
+        return clean
+
+    def _apply_strategy_suggestions_from_plan(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        clean = sanitize_strategy_suggestions(plan.get("strategy_suggestions"))
+        if not clean:
+            return {}
+
+        if clean.get("revision_scope") in {"page_only", "global"}:
+            plan["scope"] = clean["revision_scope"]
         return clean
 
     # -----------------------------------------------------
@@ -318,7 +391,9 @@ class ComicAgent:
             if isinstance(plan, dict) and plan:
                 plan.setdefault("user_message", user_message)
                 clean_suggestions = self._apply_skill_suggestions_from_plan(job, plan)
+                clean_strategy = self._apply_strategy_suggestions_from_plan(plan)
                 plan["skill_param_suggestions"] = clean_suggestions
+                plan["strategy_suggestions"] = clean_strategy
                 job.pending_user_plan = plan
                 job.logs.append(f"Brain plan: intent={plan.get('intent')} scope={plan.get('scope')} ref={plan.get('reference_page_number')} conf={plan.get('confidence')}")
                 self.memory.record_brain_event(job, user_message=user_message, plan=plan)
@@ -511,7 +586,7 @@ class ComicAgent:
         page = job.pages[action.page_index]
         page.stage = PageStage.REVISING
 
-        target_page_indices = [action.page_index] if revision_mode == "auto_rag_revision" else sorted(job.pages.keys())
+        target_page_indices = self._select_revision_target_pages(job, action, plan, revision_mode)
         pages_payload: List[Dict[str, Any]] = []
         for page_index in target_page_indices:
             page_state = job.pages[page_index]
@@ -631,8 +706,10 @@ class ComicAgent:
                     changed_regions += 1
                     changed_pages.add(pi)
 
-        # Update glossary bucket.
-        if isinstance(job.glossary, dict):
+        persist_revision_memory = revision_mode != "auto_rag_revision"
+
+        # Update glossary bucket only for explicit/user-confirmed revisions.
+        if persist_revision_memory and isinstance(job.glossary, dict):
             entries = job.glossary.get("entries")
             if not isinstance(entries, list):
                 entries = []
@@ -641,13 +718,14 @@ class ComicAgent:
             job.glossary["entries"] = entries
             job.glossary["updated_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-        self.memory.record_revision_updates(
-            job,
-            page_index_to_regions=regions_before_merge,
-            patches=patches,
-            glossary_updates=glossary_updates,
-            glossary_type=(plan.get("glossary_type") if isinstance(plan, dict) else None),
-        )
+        if persist_revision_memory:
+            self.memory.record_revision_updates(
+                job,
+                page_index_to_regions=regions_before_merge,
+                patches=patches,
+                glossary_updates=glossary_updates,
+                glossary_type=(plan.get("glossary_type") if isinstance(plan, dict) else None),
+            )
 
         # Re-run lettering on changed pages.
         for pi in changed_pages:

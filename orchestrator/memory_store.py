@@ -37,9 +37,12 @@ class LocalMemoryStore:
             if not image_ref:
                 continue
             p = Path(image_ref)
+            if not p.is_absolute() and p.parent == Path("."):
+                continue
             if p.parent.name in {"pages", "erased", "rendered", "masks"}:
                 return p.parent.parent
-            return p.parent
+            if p.parent != Path("."):
+                return p.parent
 
         return Path("data/jobs") / str(job.job_id)
 
