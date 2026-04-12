@@ -7,6 +7,17 @@ from typing import Dict, Any, List, Optional
 from .state import PageState
 
 
+def _page_range(page_indices: List[int]) -> Dict[str, Any]:
+    ordered = sorted(int(x) for x in page_indices)
+    return {
+        "start_page_index": ordered[0],
+        "end_page_index": ordered[-1],
+        "page_count": len(ordered),
+        "page_indices": ordered,
+        "label": f"{ordered[0]}-{ordered[-1]}",
+    }
+
+
 class Tools:
     """
     这里是对 skills 的调用封装层。
@@ -151,6 +162,19 @@ class Tools:
             model = os.getenv("MANGA_AGENT_VLM_MODEL", "qwen3.6-plus")
             base_url = os.getenv("MANGA_AGENT_VLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
             temperature = float(os.getenv("MANGA_AGENT_VLM_TEMPERATURE", "0.0"))
+            timeout_raw = (os.getenv("MANGA_AGENT_VLM_TIMEOUT_SECONDS", "") or "").strip()
+            timeout_seconds = float(timeout_raw) if timeout_raw else None
+            enable_thinking = (os.getenv("MANGA_AGENT_VLM_ENABLE_THINKING", "false") or "false").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            thinking_budget = int(os.getenv("MANGA_AGENT_VLM_THINKING_BUDGET", "81920"))
+            vl_high_resolution_images = (
+                (os.getenv("MANGA_AGENT_VLM_HIGH_RESOLUTION_IMAGES", "true") or "true").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
             # Resize policy defaults (aligned with common US-comic page scans):
             # - cap height to 3057
             # - do not cap width (keeps double-page spreads)
@@ -164,6 +188,10 @@ class Tools:
                     model=model,
                     base_url=base_url,
                     temperature=temperature,
+                    timeout_seconds=timeout_seconds,
+                    enable_thinking=enable_thinking,
+                    thinking_budget=thinking_budget,
+                    vl_high_resolution_images=vl_high_resolution_images,
                     max_width=0,
                     max_height=0,
                     max_long_side=0,
@@ -173,6 +201,10 @@ class Tools:
                     model=model,
                     base_url=base_url,
                     temperature=temperature,
+                    timeout_seconds=timeout_seconds,
+                    enable_thinking=enable_thinking,
+                    thinking_budget=thinking_budget,
+                    vl_high_resolution_images=vl_high_resolution_images,
                     max_width=max_width,
                     max_height=max_height,
                     max_long_side=max_long_side,
@@ -198,6 +230,10 @@ class Tools:
                     model=model,
                     base_url=base_url,
                     temperature=temperature,
+                    timeout_seconds=timeout_seconds,
+                    enable_thinking=enable_thinking,
+                    thinking_budget=thinking_budget,
+                    vl_high_resolution_images=vl_high_resolution_images,
                     max_width=0,
                     max_height=0,
                     max_long_side=0,
@@ -226,6 +262,7 @@ class Tools:
                         "bbox": r.get("bbox_xywh"),
                         "region_type": "text",
                         "has_text_box": r.get("has_text_box"),
+                        "color": r.get("color", "black"),
                         "src_text": r.get("src_text", ""),
                         "tgt_text": r.get("tgt_text", ""),
                     }
@@ -234,6 +271,7 @@ class Tools:
             metrics = raw.get("metrics") or {}
             return {
                 "ok": True,
+                "page_type": data.get("page_type", "content"),
                 "regions": regions_out,
                 "bbox_error": False,
                 "raw": raw,
@@ -246,6 +284,184 @@ class Tools:
             }
         except Exception as e:
             return {"ok": False, "error": {"code": "vlm_exception", "message": str(e)}}
+
+    def run_vlm_pages(
+        self,
+        pages: List[PageState],
+        *,
+        reading_direction: str = "ltr",
+        source_language: str = "en",
+        target_language: str = "zh",
+        retrieval_contexts: Optional[Dict[int, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """VLM core for a small page window in one request.
+
+        Preferred contract:
+        {
+          ok: bool,
+          page_range: {...},
+          pages: [{page_index, regions, bbox_error, vlm_metrics}],
+          raw: <vendor response>
+        }
+        """
+
+        if not pages:
+            return {"ok": False, "error": {"code": "missing_pages", "message": "pages is empty"}}
+
+        try:
+            from skills.vlm_page_translate.vlm import (
+                VLMPageTranslateConfig,
+                vlm_extract_translate_pages,
+            )
+        except Exception:
+            batch_result = None
+        else:
+            batch_result = "available"
+
+        if batch_result == "available":
+            model = os.getenv("MANGA_AGENT_VLM_MODEL", "qwen3.6-plus")
+            base_url = os.getenv("MANGA_AGENT_VLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+            temperature = float(os.getenv("MANGA_AGENT_VLM_TEMPERATURE", "0.0"))
+            timeout_raw = (os.getenv("MANGA_AGENT_VLM_TIMEOUT_SECONDS", "") or "").strip()
+            timeout_seconds = float(timeout_raw) if timeout_raw else None
+            enable_thinking = (os.getenv("MANGA_AGENT_VLM_ENABLE_THINKING", "false") or "false").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            thinking_budget = int(os.getenv("MANGA_AGENT_VLM_THINKING_BUDGET", "81920"))
+            vl_high_resolution_images = (
+                (os.getenv("MANGA_AGENT_VLM_HIGH_RESOLUTION_IMAGES", "true") or "true").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+            max_width = int(os.getenv("MANGA_AGENT_VLM_MAX_WIDTH", "0"))
+            max_height = int(os.getenv("MANGA_AGENT_VLM_MAX_HEIGHT", "3057"))
+            max_long_side = int(os.getenv("MANGA_AGENT_VLM_MAX_LONG_SIDE", "0"))
+            cfg = VLMPageTranslateConfig(
+                model=model,
+                base_url=base_url,
+                temperature=temperature,
+                timeout_seconds=timeout_seconds,
+                enable_thinking=enable_thinking,
+                thinking_budget=thinking_budget,
+                vl_high_resolution_images=vl_high_resolution_images,
+                max_width=max_width,
+                max_height=max_height,
+                max_long_side=max_long_side,
+            )
+            page_payloads = []
+            for page in pages:
+                if not page.image_ref:
+                    return {"ok": False, "error": {"code": "missing_image_ref", "message": f"page {page.page_index} image_ref is empty"}}
+                path = Path(page.image_ref)
+                if not (path.exists() and path.is_file()):
+                    return {"ok": False, "error": {"code": "missing_image_file", "message": f"Image not found: {path}"}}
+                page_payloads.append(
+                    {
+                        "page_index": page.page_index,
+                        "image_bytes": path.read_bytes(),
+                        "retrieval_context": (retrieval_contexts or {}).get(page.page_index) or {},
+                    }
+                )
+
+            try:
+                raw = vlm_extract_translate_pages(
+                    pages=page_payloads,
+                    reading_direction=reading_direction,
+                    source_language=source_language,
+                    target_language=target_language,
+                    config=cfg,
+                )
+            except Exception as e:
+                return {"ok": False, "error": {"code": "vlm_exception", "message": str(e)}}
+
+            if not raw.get("ok"):
+                return {"ok": False, "error": raw.get("error"), "raw": raw}
+
+            data = raw.get("data") or {}
+            metrics = raw.get("metrics") or {}
+            page_metrics_by_index = {
+                int(item.get("page_index")): item
+                for item in (metrics.get("pages") or [])
+                if isinstance(item, dict) and str(item.get("page_index")).strip().isdigit()
+            }
+            pages_out = []
+            for item in data.get("pages", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    page_index = int(item.get("page_index"))
+                except Exception:
+                    continue
+                regions_out = []
+                for r in item.get("regions", []) or []:
+                    if not isinstance(r, dict):
+                        continue
+                    regions_out.append(
+                        {
+                            "region_id": int(r.get("region_id")),
+                            "bbox": r.get("bbox_xywh"),
+                            "region_type": "text",
+                            "has_text_box": r.get("has_text_box"),
+                            "color": r.get("color", "black"),
+                            "src_text": r.get("src_text", ""),
+                            "tgt_text": r.get("tgt_text", ""),
+                        }
+                    )
+                pm = page_metrics_by_index.get(page_index) or {}
+                pages_out.append(
+                    {
+                        "page_index": page_index,
+                        "page_type": item.get("page_type", "content"),
+                        "regions": regions_out,
+                        "bbox_error": False,
+                        "vlm_metrics": {
+                            "orig": (pm.get("orig_width"), pm.get("orig_height")),
+                            "sent": (pm.get("sent_width"), pm.get("sent_height")),
+                            "downscaled": pm.get("downscaled"),
+                            "usage": metrics.get("usage"),
+                        },
+                    }
+                )
+
+            return {
+                "ok": True,
+                "page_range": data.get("page_range") or metrics.get("page_range") or _page_range([page.page_index for page in pages]),
+                "pages": pages_out,
+                "raw": raw,
+                "batch_metrics": metrics,
+            }
+
+        # Compatibility fallback for older/offline tools: run page by page.
+        pages_out = []
+        for page in pages:
+            result = self.run_vlm_page(
+                page,
+                reading_direction=reading_direction,
+                source_language=source_language,
+                target_language=target_language,
+                force_fullres=False,
+                retrieval_context=(retrieval_contexts or {}).get(page.page_index) or {},
+            )
+            if not result.get("ok"):
+                return {"ok": False, "error": result.get("error"), "raw": result}
+            pages_out.append(
+                {
+                    "page_index": page.page_index,
+                    "page_type": result.get("page_type", "content"),
+                    "regions": result.get("regions") or [],
+                    "bbox_error": bool(result.get("bbox_error", False)),
+                    "vlm_metrics": result.get("vlm_metrics") or {},
+                }
+            )
+        return {
+            "ok": True,
+            "page_range": _page_range([page.page_index for page in pages]),
+            "pages": pages_out,
+            "raw": {"fallback_mode": "loop_single_page"},
+            "batch_metrics": {"page_count": len(pages_out)},
+        }
 
     def run_vlm_judge_text_only(
         self,
@@ -286,10 +502,12 @@ class Tools:
         self,
         *,
         pages: List[Dict[str, Any]],
+        document_range: Optional[Dict[str, Any]] = None,
         revision_mode: str,
         user_request: str,
         reference_page_number: Optional[int],
         scope: str,
+        apply_page_indices: Optional[List[int]] = None,
         from_side: str,
         from_text: Optional[str],
         to_text: Optional[str],
@@ -323,10 +541,12 @@ class Tools:
 
             return revise_vlm_translation(
                 pages=pages,
+                document_range=document_range,
                 revision_mode=revision_mode,
                 user_request=user_request,
                 reference_page_number=reference_page_number,
                 scope=scope,
+                apply_page_indices=apply_page_indices,
                 from_side=from_side,
                 from_text=from_text,
                 to_text=to_text,
@@ -455,6 +675,7 @@ class Tools:
                                 "region_id": int(region_id),
                                 "bbox_xywh": region.bbox,
                                 "has_text_box": region.has_text_box,
+                                "color": region.color,
                                 "translated_text": region.translated_text or "",
                             }
                         )
@@ -475,19 +696,28 @@ class Tools:
                     coarse_mask_bytes = out.get("coarse_mask_bytes")
                     mask_bytes = out.get("mask_bytes")
                     overlay_bytes = out.get("mask_overlay_bytes")
+                    mask_artifacts = {}
                     if any(isinstance(x, (bytes, bytearray)) for x in [coarse_mask_bytes, mask_bytes, overlay_bytes]):
                         job_dir = path.parent.parent if path.parent.name == "pages" else path.parent
                         masks_dir = job_dir / "masks"
                         masks_dir.mkdir(parents=True, exist_ok=True)
                         stem = f"page_{page.page_index:04d}"
                         if isinstance(coarse_mask_bytes, (bytes, bytearray)):
-                            (masks_dir / f"{stem}_coarse.png").write_bytes(bytes(coarse_mask_bytes))
+                            coarse_path = masks_dir / f"{stem}_coarse.png"
+                            coarse_path.write_bytes(bytes(coarse_mask_bytes))
+                            mask_artifacts["coarse_mask_ref"] = str(coarse_path)
                         if isinstance(mask_bytes, (bytes, bytearray)):
-                            (masks_dir / f"{stem}_refined.png").write_bytes(bytes(mask_bytes))
+                            refined_path = masks_dir / f"{stem}_refined.png"
+                            refined_path.write_bytes(bytes(mask_bytes))
+                            mask_artifacts["refined_mask_ref"] = str(refined_path)
                         if isinstance(overlay_bytes, (bytes, bytearray)):
-                            (masks_dir / f"{stem}_overlay.png").write_bytes(bytes(overlay_bytes))
+                            overlay_path = masks_dir / f"{stem}_overlay.png"
+                            overlay_path.write_bytes(bytes(overlay_bytes))
+                            mask_artifacts["overlay_ref"] = str(overlay_path)
 
-                    metrics = out.get("metrics") or {}
+                    metrics = dict(out.get("metrics") or {})
+                    if mask_artifacts:
+                        metrics["mask_artifacts"] = mask_artifacts
                     return {
                         "ok": True,
                         "erase_backend": metrics.get("erase_backend"),
@@ -517,6 +747,7 @@ class Tools:
                                 "region_id": int(region_id),
                                 "bbox_xywh": region.bbox,
                                 "has_text_box": region.has_text_box,
+                                "color": region.color,
                                 "translated_text": region.translated_text or "",
                             }
                         )

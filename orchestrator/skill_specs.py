@@ -9,6 +9,8 @@ from typing import Any, Dict, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_MD_PATHS = {
+    "vlm_page_translate": REPO_ROOT / "skills" / "vlm_page_translate" / "SKILL.md",
+    "vlm_translation_revision": REPO_ROOT / "skills" / "vlm_translation_revision" / "SKILL.md",
     "lama_eraser": REPO_ROOT / "skills" / "lama_erase_server" / "SKILL.md",
     "lettering": REPO_ROOT / "skills" / "lettering_basic_v0" / "SKILL.md",
 }
@@ -183,5 +185,67 @@ def sanitize_strategy_suggestions(raw: Optional[Dict[str, Any]]) -> Dict[str, An
     page_profile = raw.get("page_profile")
     if str(page_profile or "").strip().lower() in {"default", "art_integrated", "boxed_dialogue"}:
         out["page_profile"] = str(page_profile).strip().lower()
+
+    recommended_page_action = raw.get("recommended_page_action")
+    allowed_page_actions = {
+        "continue",
+        "ask_user",
+        "retry_typeset",
+        "retry_erase",
+        "retry_vlm_page",
+        "retry_translation",
+        "retry_ocr",
+        "retry_detection",
+        "run_revision",
+    }
+    if str(recommended_page_action or "").strip().lower() in allowed_page_actions:
+        out["recommended_page_action"] = str(recommended_page_action).strip().lower()
+
+    ask_user_reason = raw.get("ask_user_reason")
+    if isinstance(ask_user_reason, str):
+        ask_user_reason = ask_user_reason.strip()
+        if ask_user_reason:
+            out["ask_user_reason"] = ask_user_reason
+
+    return out
+
+
+def sanitize_job_strategy_suggestions(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+
+    out: Dict[str, Any] = {}
+
+    recommended_job_action = raw.get("recommended_job_action")
+    if str(recommended_job_action or "").strip().lower() in {"continue", "run_vlm_batch", "ask_user"}:
+        out["recommended_job_action"] = str(recommended_job_action).strip().lower()
+
+    ask_user_reason = raw.get("ask_user_reason")
+    if isinstance(ask_user_reason, str):
+        ask_user_reason = ask_user_reason.strip()
+        if ask_user_reason:
+            out["ask_user_reason"] = ask_user_reason
+
+    batching_mode = raw.get("batching_mode")
+    if str(batching_mode or "").strip().lower() in {"contiguous_window"}:
+        out["batching_mode"] = str(batching_mode).strip().lower()
+
+    vlm_batch_size = raw.get("vlm_batch_size")
+    try:
+        if vlm_batch_size is not None:
+            out["vlm_batch_size"] = max(1, min(10, int(vlm_batch_size)))
+    except Exception:
+        pass
+
+    page_indices = raw.get("vlm_batch_page_indices")
+    if isinstance(page_indices, list):
+        clean_indices = []
+        for item in page_indices[:10]:
+            try:
+                clean_indices.append(int(item))
+            except Exception:
+                continue
+        if clean_indices:
+            out["vlm_batch_page_indices"] = clean_indices
 
     return out

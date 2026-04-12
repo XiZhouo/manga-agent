@@ -48,8 +48,12 @@ class OfflineRevisionTools(Tools):
         super().__init__()
         self.vlm_calls = 0
         self.auto_revision_calls = 0
+        self.auto_revision_document_ranges = []
         self.user_revision_calls = 0
         self.user_revision_candidate_pages = None
+        self.user_revision_apply_page_indices = None
+        self.user_revision_document_range = None
+        self.user_revision_retrieval_context = None
         self.lettering_calls = 0
 
     def run_vlm_page(self, page, **kw):
@@ -113,6 +117,7 @@ class OfflineRevisionTools(Tools):
 
         if mode == "auto_rag_revision":
             self.auto_revision_calls += 1
+            self.auto_revision_document_ranges.append(kwargs.get("document_range"))
             for p in pages:
                 p2 = {"page_index": int(p.get("page_index")), "regions": []}
                 for r in p.get("regions") or []:
@@ -145,6 +150,9 @@ class OfflineRevisionTools(Tools):
         else:
             self.user_revision_calls += 1
             self.user_revision_candidate_pages = len(pages)
+            self.user_revision_apply_page_indices = kwargs.get("apply_page_indices")
+            self.user_revision_document_range = kwargs.get("document_range")
+            self.user_revision_retrieval_context = kwargs.get("retrieval_context")
             for p in pages:
                 p2 = {"page_index": int(p.get("page_index")), "regions": []}
                 for r in p.get("regions") or []:
@@ -228,9 +236,11 @@ def main() -> None:
     print("tgt_after_auto_p1=", job.pages[0].regions[1].translated_text)
     print("tgt_after_auto_p2=", job.pages[1].regions[1].translated_text)
     print("tgt_after_auto_p3=", job.pages[2].regions[1].translated_text)
+    print("auto_revision_document_ranges=", tools.auto_revision_document_ranges)
     assert job.pages[0].regions[1].translated_text == "原力与你同在"
     assert job.pages[2].regions[1].translated_text == "再见"
-    assert tools.auto_revision_calls >= 3
+    assert tools.auto_revision_calls == 1
+    assert (tools.auto_revision_document_ranges[0] or {}).get("label") == "0-2"
 
     # User correction
     agent.handle_user_message(job_id, "第1页的 World 应该翻译成 天下，请修改所有相关的问题")
@@ -257,11 +267,16 @@ def main() -> None:
     print("tgt_after_user_p1_r2=", job.pages[0].regions[2].translated_text)
     print("tgt_after_user_p2_r2=", job.pages[1].regions[2].translated_text)
     print("user_revision_candidate_pages=", tools.user_revision_candidate_pages)
+    print("user_revision_apply_page_indices=", tools.user_revision_apply_page_indices)
+    print("user_revision_document_range=", tools.user_revision_document_range)
     print("glossary_entries=", len((job.glossary or {}).get("entries") or []))
     assert job.pages[0].regions[2].translated_text == "天下"
     assert job.pages[1].regions[2].translated_text == "天下"
     assert job.pages[2].regions[1].translated_text == "再见"
-    assert tools.user_revision_candidate_pages == 2
+    assert tools.user_revision_candidate_pages == 3
+    assert tools.user_revision_apply_page_indices == [0, 1]
+    assert (tools.user_revision_document_range or {}).get("label") == "0-2"
+    assert (tools.user_revision_retrieval_context or {}).get("document_range", {}).get("label") == "0-2"
     assert tools.user_revision_calls == 1
     assert len((job.glossary or {}).get("entries") or []) == 1
     print("tail_logs=")

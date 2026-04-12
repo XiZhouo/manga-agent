@@ -15,8 +15,11 @@ from PIL import Image
 def _start_server() -> None:
     # Import inside thread so the app module is available.
     import uvicorn
+    from skills.lama_erase_server import server as lama_server
 
-    os.environ.setdefault("MANGA_AGENT_LAMA_BACKEND", "opencv")
+    lama_server._resolve_lama_runner = lambda cfg: "simple_lama"  # type: ignore[assignment]
+    lama_server._inpaint_simple_lama = lambda img_bgr, mask: img_bgr  # type: ignore[assignment]
+    os.environ.setdefault("LAMA_RUNNER", "simple_lama")
 
     uvicorn.run(
         "skills.lama_erase_server.server:app",
@@ -50,7 +53,7 @@ def _make_test_image() -> bytes:
 
 
 def main() -> None:
-    # Start local HTTP server (OpenCV fallback backend)
+    # Start local HTTP server with a stubbed simple_lama backend.
     t = threading.Thread(target=_start_server, daemon=True)
     t.start()
 
@@ -76,7 +79,7 @@ def main() -> None:
     ]
 
     os.environ["MANGA_AGENT_LAMA_URL"] = "http://127.0.0.1:8765"
-    os.environ["MANGA_AGENT_LAMA_BACKEND"] = "opencv"
+    os.environ["MANGA_AGENT_LAMA_BACKEND"] = "lama"
 
     out = render_lettered_page(image_bytes=image_bytes, regions=regions)
     assert out.get("ok") is True, out

@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from orchestrator import ComicAgent, DecisionEngine, InMemoryStateStore, Tools, JobStatus
 from orchestrator.memory_store import LocalMemoryStore
-from skills.input_normalization.normalize import normalize_file
 
 
 def _utc_iso() -> str:
@@ -37,6 +36,9 @@ def _load_pages_from_directory(input_dir: Path, max_pages: Optional[int]) -> Lis
 def _normalize_input(input_path: Path, max_pages: Optional[int]) -> List[Dict[str, Any]]:
     if input_path.is_dir():
         return _load_pages_from_directory(input_path, max_pages)
+
+    # Import lazily so manifest-only/offline tests do not require imaging deps.
+    from skills.input_normalization.normalize import normalize_file
 
     file_type = _infer_file_type(input_path)
     file_bytes = input_path.read_bytes()
@@ -89,6 +91,7 @@ def _build_run_manifest(job_state) -> Dict[str, Any]:
                     "bbox": r.bbox,
                     "region_type": r.region_type,
                     "has_text_box": r.has_text_box,
+                    "color": r.color,
                     "ocr_text": r.ocr_text,
                     "ocr_confidence": r.ocr_confidence,
                     "translated_text": r.translated_text,
@@ -101,11 +104,23 @@ def _build_run_manifest(job_state) -> Dict[str, Any]:
         pages_out.append(
             {
                 "page_index": page.page_index,
+                "page_type": getattr(page, "page_type", "content"),
                 "image_ref": page.image_ref,
                 "erased_image_ref": getattr(page, "erased_image_ref", None),
                 "rendered_image_ref": getattr(page, "rendered_image_ref", None),
                 "skill_param_suggestions": getattr(page, "skill_param_suggestions", None),
                 "strategy_suggestions": getattr(page, "strategy_suggestions", None),
+                "page_brain": {
+                    "summary": getattr(page, "page_brain_summary", None),
+                    "last_actionable_summary": getattr(page, "page_brain_last_actionable_summary", None),
+                    "confidence": getattr(page, "page_brain_confidence", None),
+                    "stage_last": getattr(page, "page_brain_stage_last", None),
+                },
+                "document_ranges": {
+                    "vlm_batch": getattr(page, "vlm_batch_range", None),
+                    "revision": getattr(page, "revision_batch_range", None),
+                    "vlm_batch_id": getattr(page, "vlm_batch_id", None),
+                },
                 "stage": page.stage.value,
                 "vlm": {
                     "quality_ok": getattr(page, "vlm_quality_ok", None),
@@ -138,8 +153,109 @@ def _build_run_manifest(job_state) -> Dict[str, Any]:
                 },
                 "erase_ok": getattr(page, "erase_ok", None),
                 "erase_backend": getattr(page, "erase_backend", None),
+                "erase_metrics": getattr(page, "erase_metrics", None),
                 "lettering_ok": page.lettering_ok,
+                "typeset_metrics": getattr(page, "typeset_metrics", None),
                 "regions": regions_out,
+                }
+            )
+
+    page_stage_counts: Dict[str, int] = {}
+    for item in pages_out:
+        stage = str(item.get("stage") or "")
+        page_stage_counts[stage] = page_stage_counts.get(stage, 0) + 1
+
+    pages_by_index = {
+        int(item["page_index"]): item
+        for item in pages_out
+        if str(item.get("page_index")).strip().isdigit()
+    }
+
+    def _pages_for_indices(page_indices: List[int]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for page_index in page_indices:
+            page = pages_by_index.get(int(page_index))
+            if not page:
+                continue
+            out.append(
+                {
+                    "page_index": page["page_index"],
+                    "page_type": page.get("page_type"),
+                    "stage": page.get("stage"),
+                    "rendered_image_ref": page.get("rendered_image_ref"),
+                    "erased_image_ref": page.get("erased_image_ref"),
+                    "translation_consistent": page.get("translation_consistent"),
+                    "auto_revision": {
+                        "done": ((page.get("auto_revision") or {}).get("done")),
+                        "changed": ((page.get("auto_revision") or {}).get("changed")),
+                    },
+                }
+            )
+        return out
+
+    raw_vlm_batches = list(getattr(job_state, "vlm_batches", None) or [])
+    vlm_windows = []
+    page_to_vlm_window: Dict[str, Any] = {}
+    for idx, batch in enumerate(raw_vlm_batches, start=1):
+        if not isinstance(batch, dict):
+            continue
+        page_range = batch.get("page_range") if isinstance(batch.get("page_range"), dict) else {}
+        page_indices = [int(x) for x in (page_range.get("page_indices") or []) if str(x).strip().isdigit()]
+        pages_in_window = _pages_for_indices(page_indices)
+        status_counts: Dict[str, int] = {}
+        for page in pages_in_window:
+            stage = str(page.get("stage") or "")
+            status_counts[stage] = status_counts.get(stage, 0) + 1
+            page_to_vlm_window[str(page["page_index"])] = {
+                "window_index": idx,
+                "label": page_range.get("label"),
+                "batch_id": batch.get("batch_id"),
+            }
+        vlm_windows.append(
+            {
+                "window_index": idx,
+                "batch_id": batch.get("batch_id"),
+                "page_range": page_range,
+                "page_count": len(page_indices),
+                "metrics": batch.get("metrics"),
+                "created_at": batch.get("created_at"),
+                "status_counts": status_counts,
+                "pages": pages_in_window,
+            }
+        )
+
+    raw_revision_batches = list(getattr(job_state, "revision_batches", None) or [])
+    revision_windows = []
+    page_to_revision_windows: Dict[str, List[Dict[str, Any]]] = {}
+    for idx, batch in enumerate(raw_revision_batches, start=1):
+        if not isinstance(batch, dict):
+            continue
+        page_range = batch.get("page_range") if isinstance(batch.get("page_range"), dict) else {}
+        page_indices = [int(x) for x in (page_range.get("page_indices") or []) if str(x).strip().isdigit()]
+        changed_pages = [int(x) for x in (batch.get("changed_pages") or []) if str(x).strip().isdigit()]
+        pages_in_window = _pages_for_indices(page_indices)
+        changed_page_details = _pages_for_indices(changed_pages)
+        for page_index in page_indices:
+            page_to_revision_windows.setdefault(str(page_index), []).append(
+                {
+                    "window_index": idx,
+                    "label": page_range.get("label"),
+                    "revision_mode": batch.get("revision_mode"),
+                    "changed": page_index in changed_pages,
+                }
+            )
+        revision_windows.append(
+            {
+                "window_index": idx,
+                "revision_mode": batch.get("revision_mode"),
+                "page_range": page_range,
+                "candidate_pages": batch.get("candidate_pages"),
+                "patch_count": batch.get("patch_count"),
+                "warnings": batch.get("warnings"),
+                "created_at": batch.get("created_at"),
+                "changed_pages": changed_pages,
+                "changed_page_details": changed_page_details,
+                "pages": pages_in_window,
             }
         )
 
@@ -150,6 +266,41 @@ def _build_run_manifest(job_state) -> Dict[str, Any]:
         "target_language": job_state.target_language,
         "created_at": job_state.created_at,
         "updated_at": job_state.updated_at,
+        "workflow": {
+            "pipeline_mode": getattr(job_state, "user_preferences", {}).get("pipeline_mode"),
+            "vlm_batch_size": getattr(job_state, "vlm_batch_size", None),
+            "job_brain": {
+                "summary": getattr(job_state, "job_brain_summary", None),
+                "confidence": getattr(job_state, "job_brain_confidence", None),
+                "stage_last": getattr(job_state, "job_brain_stage_last", None),
+                "strategy_suggestions": getattr(job_state, "job_strategy_suggestions", None),
+            },
+        },
+        "batch_views": {
+            "vlm_windows": vlm_windows,
+            "revision_windows": revision_windows,
+        },
+        "page_views": {
+            "summary": {
+                "page_count": len(pages_out),
+                "stage_counts": page_stage_counts,
+                "rendered_pages": sum(1 for item in pages_out if item.get("rendered_image_ref")),
+                "erased_pages": sum(1 for item in pages_out if item.get("erased_image_ref")),
+            },
+            "page_to_vlm_window": page_to_vlm_window,
+            "page_to_revision_windows": page_to_revision_windows,
+            "pages": pages_out,
+        },
+        # Backward-compatible flat keys for older tooling.
+        "job_brain": {
+            "summary": getattr(job_state, "job_brain_summary", None),
+            "confidence": getattr(job_state, "job_brain_confidence", None),
+            "stage_last": getattr(job_state, "job_brain_stage_last", None),
+            "strategy_suggestions": getattr(job_state, "job_strategy_suggestions", None),
+        },
+        "vlm_batch_size": getattr(job_state, "vlm_batch_size", None),
+        "vlm_batches": getattr(job_state, "vlm_batches", None),
+        "revision_batches": getattr(job_state, "revision_batches", None),
         "pages": pages_out,
     }
 
@@ -181,6 +332,8 @@ def _package_zip(output_zip: Path, *, job_dir: Path, run_manifest: Dict[str, Any
         zf.writestr("run_manifest.json", json.dumps(run_manifest, ensure_ascii=False, indent=2))
         zf.writestr("glossary.json", json.dumps(glossary, ensure_ascii=False, indent=2))
         zf.writestr("rag_bundle.json", json.dumps(rag_bundle, ensure_ascii=False, indent=2))
+        zf.writestr("vlm_batches.json", json.dumps(run_manifest.get("vlm_batches") or [], ensure_ascii=False, indent=2))
+        zf.writestr("revision_batches.json", json.dumps(run_manifest.get("revision_batches") or [], ensure_ascii=False, indent=2))
 
         # original pages
         if pages_dir.exists():
@@ -218,6 +371,14 @@ def _write_artifacts(job_dir: Path, *, run_manifest: Dict[str, Any], glossary: D
     )
     (job_dir / "rag_bundle.json").write_text(
         json.dumps(rag_bundle, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (job_dir / "vlm_batches.json").write_text(
+        json.dumps(run_manifest.get("vlm_batches") or [], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (job_dir / "revision_batches.json").write_text(
+        json.dumps(run_manifest.get("revision_batches") or [], ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 

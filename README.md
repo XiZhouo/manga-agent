@@ -16,6 +16,7 @@ pip install -r requirements.txt
 
 - `pdf2image` requires Poppler (`pdftoppm`).
 - `rarfile` may require `unrar` for `.rar/.cbr`.
+- For Windows GPU deployment of the LaMa HTTP service, see `docs/windows_lama_deployment.md`.
 
 ## Design Spec (working notes)
 
@@ -62,7 +63,8 @@ Classic (fallback)
 
 VLM core (new)
 	InputNormalization
-		-> VLMPageTranslate(qwen3.6-plus: detect+OCR+translate)
+		-> Job-level VLM batching (default: 10 contiguous pages)
+			-> VLMPageTranslate(qwen3.6-plus: detect+OCR+translate)
 			-> LaMaErase(v0)
 				-> Lettering(v0, block text)
 				-> PackageZIP
@@ -74,6 +76,7 @@ Switching policy:
 
 Token/quality knob (VLM):
 
+- `MANGA_AGENT_VLM_BATCH_SIZE` (default: `10`, max recommended: `10`). The job-level brain opens one contiguous VLM page window at a time.
 - `MANGA_AGENT_VLM_MAX_HEIGHT` (default: `3057`). If the image height is larger, it will be downscaled for the VLM call, and returned bboxes are mapped back to original pixel coordinates.
 - `MANGA_AGENT_VLM_MAX_WIDTH` (default: `0`, meaning no cap). If set (e.g. `3057`), width larger than this will be downscaled too (cheaper but may affect double-page spreads).
 - `MANGA_AGENT_VLM_MAX_LONG_SIDE` (default: `0`, optional extra safety cap).
@@ -104,6 +107,12 @@ To behave like an **agent** (not just a fixed pipeline), the orchestrator suppor
 3) The DecisionEngine executes the plan (ask user / rerun page / run revision).
 4) For corrections, we run a **text-only revision skill** that patches existing VLM outputs (no image upload, no VLM rerun).
 5) Only affected pages are re-lettered, reusing cached erased pages whenever possible.
+
+Job-level brain:
+
+- The orchestrator now has a job-level strategy layer above page-level decisions.
+- In `vlm` mode it decides when to open the next contiguous VLM page window.
+- Default policy: finish active translated/erase/typeset pages first, then open the next VLM batch of up to 10 pages.
 
 Brain knobs:
 
@@ -151,7 +160,12 @@ Even if correction is “within job”, we still generate editable artifacts so 
 
 - `glossary.json` (editable by user; re-upload to update within job)
 - `run_manifest.json` (internal index; used to map text -> page/bubble)
+- `vlm_batches.json` (raw batch/window execution records)
+- `revision_batches.json` (raw revision-window execution records)
 - `erased/page_XXXX.png` (cached inpaint result; reused for re-typesetting)
+- `masks/page_XXXX_coarse.png` (coarse region mask before completion)
+- `masks/page_XXXX_refined.png` (final page mask sent to LaMa)
+- `masks/page_XXXX_overlay.png` (debug overlay to inspect mask quality)
 - `memory/glossary.json`
 - `memory/translation_memory.json`
 - `memory/style_memory.json`
@@ -159,6 +173,49 @@ Even if correction is “within job”, we still generate editable artifacts so 
 - `memory/brain_memory.json`
 
 NOTE: `run_manifest.json` should be considered internal; it is allowed to be packaged but is not meant as user UX.
+
+### `run_manifest.json` structure (current)
+
+The manifest now exposes both a batch view and a page view so downstream tools can inspect either the window-level flow or a single-page state without rebuilding the mapping themselves.
+
+```text
+run_manifest.json
+  workflow
+    pipeline_mode
+    vlm_batch_size
+    job_brain{summary, confidence, stage_last, strategy_suggestions}
+  batch_views
+    vlm_windows[]
+    revision_windows[]
+  page_views
+    summary{page_count, stage_counts, rendered_pages, erased_pages}
+    page_to_vlm_window
+    page_to_revision_windows
+    pages[]
+```
+
+Backward-compatible flat keys are still preserved for older tooling:
+
+- `job_brain`
+- `vlm_batch_size`
+- `vlm_batches`
+- `revision_batches`
+- `pages`
+
+### LaMa mask chain (current)
+
+The erase path is now explicitly split into `region metadata -> mask refinement -> LaMa`.
+
+For each region:
+
+1. VLM supplies `bbox_xywh` plus `has_text_box`.
+2. The client expands the ROI a little before mask extraction.
+3. `refine_mask()` picks a threshold candidate and removes obviously bad components.
+4. `complete_mask()` closes gaps / fills holes, especially for `has_text_box=false` art-integrated text.
+5. Region masks are merged into one page mask and persisted as debug artifacts.
+6. LaMa receives only `image + final mask + profile`.
+
+Important consequence: improving erase quality for cases like `test3` is primarily a mask problem first, not an inpainting-model switch first.
 
 ### Glossary / RAG (v0 contract)
 
@@ -251,16 +308,27 @@ image_size: {width, height}
 Input:
 
 ```text
-page_index, image_bytes, reading_direction, source_language=en, target_language=zh
+page_range{start_page_index,end_page_index,page_count,page_indices},
+pages[{page_index, image_bytes, retrieval_context?}],
+reading_direction,
+source_language=en,
+target_language=zh
 ```
 
 Output payload:
 
 ```text
-regions: [{region_id, bbox_xywh, has_text_box, src_text, tgt_text}]
-image_size: {width, height}
+page_range{start_page_index,end_page_index,page_count,page_indices,label}
+pages[
+  {
+    page_index,
+    regions: [{region_id, bbox_xywh, has_text_box, src_text, tgt_text}]
+  }
+]
 ```
 ```
+
+The recommended page window size is `<=10`.
 
 #### Skill2: region_ocr
 
@@ -307,12 +375,47 @@ memory_updates: [{entry_id?, src_text, tgt_text, aliases_tgt?}]
 conflicts: [{src_text, candidates[]}] 
 ```
 
+#### Skill4b: lama_eraser
+
+Input:
+
+```text
+page_index, page_range?, image_bytes,
+regions[{region_id, bbox_xywh, has_text_box, translated_text?}],
+erase_params_hint?{
+  profile,
+  mask_dilate_px,
+  mask_min_coverage,
+  mask_max_coverage,
+  embedded_box_expand_px,
+  embedded_complete_mask_close_px
+}
+```
+
+Output payload:
+
+```text
+erased_image_bytes
+coarse_mask_bytes
+mask_bytes
+mask_overlay_bytes
+results: {region_id: {erase_ok}}
+metrics: {
+  erase_backend,
+  erase_profile,
+  mask_strategy,
+  mask_pixels,
+  embedded_regions,
+  region_metrics[]
+}
+```
+
 #### Skill5: lettering_basic_v0
 
 Input:
 
 ```text
-image_bytes, regions[{region_id, bbox_xywh, has_text_box, translated_text}], render_params_hint?
+page_index, page_range?, image_bytes, regions[{region_id, bbox_xywh, has_text_box, translated_text}], render_params_hint?
 ```
 
 Output payload:
@@ -320,6 +423,31 @@ Output payload:
 ```text
 rendered_image_bytes
 results: {region_id: {render_ok, overflow, render_params}}
+```
+
+#### Skill5b: vlm_translation_revision
+
+Input:
+
+```text
+document_range{start_page_index,end_page_index,page_count,page_indices,label},
+pages[{page_index, regions[{region_id, bbox_xywh, has_text_box, src_text, tgt_text}]}],
+revision_mode,
+user_request,
+retrieval_context?,
+glossary?
+```
+
+Output payload:
+
+```text
+decision
+document_range
+pages
+changed_pages
+patches
+glossary_updates
+warnings
 ```
 
 #### Skill6: package_zip

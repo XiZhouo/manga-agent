@@ -12,13 +12,20 @@ class MaskRefinementConfig:
     mask_min_coverage: float = 0.01
     mask_max_coverage: float = 0.25
     mask_dilate_px: int = 2
+    box_expand_px: int = 1
 
     embedded_mask_min_coverage: float = 0.02
     embedded_mask_max_coverage: float = 0.45
     embedded_mask_dilate_px: int = 4
+    embedded_box_expand_px: int = 6
 
     open_kernel_px: int = 3
     close_kernel_px: int = 3
+    complete_mask_close_px: int = 3
+    embedded_complete_mask_close_px: int = 7
+    complete_mask_dilate_px: int = 0
+    embedded_complete_mask_dilate_px: int = 2
+    fill_holes: bool = True
     min_component_area_ratio: float = 0.0008
     max_component_area_ratio: float = 0.35
 
@@ -39,6 +46,19 @@ def safe_bbox_xywh(bbox: List[int], W: int, H: int) -> Optional[Tuple[int, int, 
     w = max(1, min(W - x, w))
     h = max(1, min(H - y, h))
     return (x, y, w, h)
+
+
+def expand_bbox_xywh(xywh: Tuple[int, int, int, int], W: int, H: int, expand_px: int) -> Tuple[int, int, int, int]:
+    x, y, w, h = xywh
+    pad = max(0, int(expand_px))
+    if pad <= 0:
+        return xywh
+
+    x0 = max(0, x - pad)
+    y0 = max(0, y - pad)
+    x1 = min(W, x + w + pad)
+    y1 = min(H, y + h + pad)
+    return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
 
 
 def coerce_has_text_box(value: Any) -> Optional[bool]:
@@ -109,7 +129,20 @@ def _filter_components(mask: np.ndarray, *, has_text_box: bool, cfg: MaskRefinem
     return out
 
 
-def refine_region_mask(
+def _fill_component_holes(mask: np.ndarray) -> np.ndarray:
+    import cv2
+
+    if np.count_nonzero(mask) == 0:
+        return mask
+
+    contours, _ = cv2.findContours((mask > 0).astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    out = np.zeros_like(mask)
+    for contour in contours:
+        cv2.drawContours(out, [contour], -1, 255, thickness=-1)
+    return out
+
+
+def refine_mask(
     roi_rgb: np.ndarray,
     *,
     has_text_box: bool,
@@ -159,7 +192,6 @@ def refine_region_mask(
         refined = cv2.dilate(refined, _kernel(dilate_px + 1), iterations=1)
 
     refined = (refined > 0).astype(np.uint8) * 255
-
     return {
         "coarse_mask": coarse,
         "refined_mask": refined,
@@ -168,6 +200,73 @@ def refine_region_mask(
             "refined_coverage": round(_coverage(refined), 6),
             "mask_dilate_px": int(dilate_px),
             "has_text_box": bool(has_text_box),
+        },
+    }
+
+
+def complete_mask(
+    mask: np.ndarray,
+    *,
+    has_text_box: bool,
+    cfg: MaskRefinementConfig,
+) -> Dict[str, Any]:
+    import cv2
+
+    if np.count_nonzero(mask) == 0:
+        return {
+            "completed_mask": mask,
+            "metrics": {
+                "completion_applied": False,
+                "completed_coverage": 0.0,
+                "complete_mask_close_px": 0,
+                "complete_mask_dilate_px": 0,
+            },
+        }
+
+    close_px = cfg.complete_mask_close_px if has_text_box else cfg.embedded_complete_mask_close_px
+    dilate_px = cfg.complete_mask_dilate_px if has_text_box else cfg.embedded_complete_mask_dilate_px
+
+    completed = mask.copy()
+    if close_px > 0:
+        completed = cv2.morphologyEx(completed, cv2.MORPH_CLOSE, _kernel(close_px), iterations=1)
+
+    if cfg.fill_holes:
+        completed = _fill_component_holes(completed)
+
+    completed = _filter_components(completed, has_text_box=has_text_box, cfg=cfg)
+    if np.count_nonzero(completed) == 0:
+        completed = mask.copy()
+
+    if dilate_px > 0:
+        completed = cv2.dilate(completed, _kernel(dilate_px + 1), iterations=1)
+
+    completed = (completed > 0).astype(np.uint8) * 255
+    return {
+        "completed_mask": completed,
+        "metrics": {
+            "completion_applied": (close_px > 0) or bool(cfg.fill_holes) or (dilate_px > 0),
+            "completed_coverage": round(_coverage(completed), 6),
+            "complete_mask_close_px": int(close_px),
+            "complete_mask_dilate_px": int(dilate_px),
+        },
+    }
+
+
+def refine_region_mask(
+    roi_rgb: np.ndarray,
+    *,
+    has_text_box: bool,
+    cfg: MaskRefinementConfig,
+) -> Dict[str, Any]:
+    refined = refine_mask(roi_rgb, has_text_box=has_text_box, cfg=cfg)
+    completed = complete_mask(refined["refined_mask"], has_text_box=has_text_box, cfg=cfg)
+
+    return {
+        "coarse_mask": refined["coarse_mask"],
+        "refined_mask": completed["completed_mask"],
+        "metrics": {
+            **(refined.get("metrics") or {}),
+            **(completed.get("metrics") or {}),
         },
     }
 
@@ -201,16 +300,17 @@ def build_page_mask(
         xywh = safe_bbox_xywh(bbox, W, H)
         if not xywh:
             continue
-        x, y, w, h = xywh
-
-        roi = img_rgb[y : y + h, x : x + w]
-        if roi.size == 0:
-            continue
 
         has_text_box = coerce_has_text_box(r.get("has_text_box"))
         boxed = has_text_box is not False
         if not boxed:
             embedded_regions += 1
+
+        expand_px = cfg.box_expand_px if boxed else cfg.embedded_box_expand_px
+        x, y, w, h = expand_bbox_xywh(xywh, W, H, expand_px)
+        roi = img_rgb[y : y + h, x : x + w]
+        if roi.size == 0:
+            continue
 
         refined = refine_region_mask(roi, has_text_box=boxed, cfg=cfg)
         coarse_roi = refined["coarse_mask"]
@@ -223,6 +323,10 @@ def build_page_mask(
             {
                 "region_id": r.get("region_id"),
                 "has_text_box": boxed,
+                "mask_strategy": "boxed_refine" if boxed else "embedded_refine_complete",
+                "original_bbox_xywh": list(xywh),
+                "expanded_bbox_xywh": [x, y, w, h],
+                "box_expand_px": int(expand_px),
                 **(refined.get("metrics") or {}),
             }
         )
@@ -236,9 +340,14 @@ def build_page_mask(
         "mask_overlay": np.array(overlay),
         "metrics": {
             "regions": len(region_metrics),
+            "boxed_regions": len(region_metrics) - embedded_regions,
             "embedded_regions": embedded_regions,
+            "image_pixels": int(W * H),
             "coarse_mask_pixels": int(np.count_nonzero(coarse_page_mask)),
             "mask_pixels": int(np.count_nonzero(refined_page_mask)),
+            "coarse_mask_coverage": round(_coverage(coarse_page_mask), 6),
+            "mask_coverage": round(_coverage(refined_page_mask), 6),
+            "mask_strategy": "embedded_refine_complete" if embedded_regions > 0 else "boxed_refine",
             "profile_suggestion": profile_suggestion,
             "region_metrics": region_metrics,
         },

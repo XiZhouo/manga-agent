@@ -108,6 +108,60 @@ def _neighbor_context(job, page, *, limit_regions: int = 8) -> List[Dict[str, An
     return out
 
 
+def _neighbor_context_for_page_indices(job, page_indices: List[int], *, limit_regions: int = 8) -> List[Dict[str, Any]]:
+    if not page_indices:
+        return []
+
+    ordered = sorted(int(x) for x in page_indices)
+    out: List[Dict[str, Any]] = []
+    for neighbor_index in (ordered[0] - 1, ordered[-1] + 1):
+        neighbor = job.pages.get(neighbor_index)
+        if not neighbor:
+            continue
+        added = 0
+        for region_id in sorted(neighbor.regions.keys()):
+            region = neighbor.regions[region_id]
+            src = str(region.ocr_text or "").strip()
+            tgt = str(region.translated_text or "").strip()
+            if not src and not tgt:
+                continue
+            out.append(
+                {
+                    "page_index": neighbor.page_index,
+                    "region_id": region_id,
+                    "src_text": src,
+                    "tgt_text": tgt,
+                }
+            )
+            added += 1
+            if added >= limit_regions:
+                break
+    return out
+
+
+def _window_page_examples(pages: List[Any], *, limit_pages: int = 6, limit_regions: int = 3) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for page in pages[:limit_pages]:
+        page_regions = []
+        for region_id in sorted(page.regions.keys()):
+            region = page.regions[region_id]
+            src = str(region.ocr_text or "").strip()
+            tgt = str(region.translated_text or "").strip()
+            if not src and not tgt:
+                continue
+            page_regions.append(
+                {
+                    "region_id": region_id,
+                    "src_text": src,
+                    "tgt_text": tgt,
+                }
+            )
+            if len(page_regions) >= limit_regions:
+                break
+        out.append({"page_index": page.page_index, "regions": page_regions})
+    return out
+
+
 def _format_page_context(
     *,
     style_hints: List[Dict[str, Any]],
@@ -195,6 +249,84 @@ class RetrievalContextBuilder:
             "neighbor_examples": neighbors[:6],
             "term_hints": _format_term_hints(glossary_hits=glossary_hits, tm_hits=tm_hits, limit=10),
             "page_context": page_context,
+        }
+
+    def build_for_revision(self, job, pages: List[Any], snapshot: Dict[str, Any], *, document_range: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        pages = [p for p in pages if p is not None]
+        if not pages:
+            return {
+                "rag_mode": "postalign_window",
+                "document_range": document_range or {},
+                "target_page_indices": [],
+                "glossary_hits": [],
+                "translation_memory_hits": [],
+                "style_hints": [],
+                "project_rules": [],
+                "neighbor_examples": [],
+                "target_page_examples": [],
+                "term_hints": "",
+                "page_context": "",
+                "window_context": "",
+            }
+
+        src_queries: List[str] = []
+        tgt_queries: List[str] = []
+        for page in pages:
+            src_queries.extend([str(r.ocr_text or "") for r in page.regions.values() if str(r.ocr_text or "").strip()])
+            tgt_queries.extend([str(r.translated_text or "") for r in page.regions.values() if str(r.translated_text or "").strip()])
+        queries = _unique_nonempty(src_queries + tgt_queries)
+
+        glossary_entries = [x for x in (snapshot.get("glossary", {}) or {}).get("entries", []) if isinstance(x, dict)]
+        tm_entries = [x for x in (snapshot.get("translation_memory", {}) or {}).get("entries", []) if isinstance(x, dict)]
+        style_entries = [x for x in (snapshot.get("style_memory", {}) or {}).get("entries", []) if isinstance(x, dict)]
+        project_entries = [x for x in (snapshot.get("project_memory", {}) or {}).get("entries", []) if isinstance(x, dict)]
+
+        glossary_hits = _top_entries(glossary_entries, queries=queries, limit=16)
+        tm_hits = _top_entries(tm_entries, queries=queries, limit=16)
+        style_hints = _top_entries(style_entries, queries=[], limit=6)
+        project_rules = _top_entries(project_entries, queries=[], limit=6)
+        target_page_indices = [int(page.page_index) for page in pages]
+        neighbors = _neighbor_context_for_page_indices(job, target_page_indices)
+        target_examples = _window_page_examples(sorted(pages, key=lambda p: p.page_index))
+        page_context = _format_page_context(style_hints=style_hints, project_rules=project_rules, neighbors=neighbors)
+
+        range_obj = document_range or {
+            "start_page_index": min(target_page_indices),
+            "end_page_index": max(target_page_indices),
+            "page_count": len(target_page_indices),
+            "page_indices": sorted(target_page_indices),
+            "label": f"{min(target_page_indices)}-{max(target_page_indices)}",
+        }
+        window_lines = [
+            f"Revision window: {range_obj.get('label')}",
+            f"Target pages: {', '.join(str(x) for x in sorted(target_page_indices))}",
+        ]
+        if target_examples:
+            window_lines.append("Window page examples:")
+            for item in target_examples[:6]:
+                page_index = item.get("page_index")
+                regions = item.get("regions") or []
+                sample = "; ".join(
+                    f"r{r.get('region_id')}: {str(r.get('src_text') or '').strip()} => {str(r.get('tgt_text') or '').strip()}"
+                    for r in regions[:3]
+                    if str(r.get("src_text") or "").strip() or str(r.get("tgt_text") or "").strip()
+                )
+                if sample:
+                    window_lines.append(f"- p{page_index}: {sample}")
+
+        return {
+            "rag_mode": "postalign_window",
+            "document_range": range_obj,
+            "target_page_indices": sorted(target_page_indices),
+            "glossary_hits": glossary_hits,
+            "translation_memory_hits": tm_hits,
+            "style_hints": style_hints,
+            "project_rules": project_rules,
+            "neighbor_examples": neighbors[:8],
+            "target_page_examples": target_examples,
+            "term_hints": _format_term_hints(glossary_hits=glossary_hits, tm_hits=tm_hits, limit=12),
+            "page_context": page_context,
+            "window_context": "\n".join(window_lines).strip(),
         }
 
     def build_for_brain(self, job, *, user_message: str, snapshot: Dict[str, Any]) -> Dict[str, Any]:

@@ -24,7 +24,12 @@ from .tools import Tools
 from .brain import DecisionBrain
 from .memory_store import LocalMemoryStore, utc_iso
 from .retrieval import RetrievalContextBuilder
-from .skill_specs import build_skill_context_for_brain, sanitize_skill_param_suggestions, sanitize_strategy_suggestions
+from .skill_specs import (
+    build_skill_context_for_brain,
+    sanitize_job_strategy_suggestions,
+    sanitize_skill_param_suggestions,
+    sanitize_strategy_suggestions,
+)
 
 
 class SimpleMemory:
@@ -64,8 +69,14 @@ class SimpleMemory:
     def build_translation_retrieval(self, job: JobState, page: PageState) -> Dict[str, Any]:
         return self.retrieval.build_for_translation(job, page, self.snapshot(job))
 
-    def build_revision_retrieval(self, job: JobState, page: PageState) -> Dict[str, Any]:
-        return self.retrieval.build_for_translation(job, page, self.snapshot(job))
+    def build_revision_retrieval(
+        self,
+        job: JobState,
+        *,
+        pages: List[PageState],
+        document_range: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return self.retrieval.build_for_revision(job, pages, self.snapshot(job), document_range=document_range)
 
     def build_brain_context(self, job: JobState, *, user_message: str) -> Dict[str, Any]:
         return self.retrieval.build_for_brain(job, user_message=user_message, snapshot=self.snapshot(job))
@@ -234,8 +245,20 @@ class ComicAgent:
                 return True
         return False
 
-    def _select_revision_target_pages(self, job: JobState, action: AgentAction, plan: Dict[str, Any], revision_mode: str) -> List[int]:
+    def _select_revision_seed_pages(self, job: JobState, action: AgentAction, plan: Dict[str, Any], revision_mode: str) -> List[int]:
         if revision_mode == "auto_rag_revision":
+            explicit = plan.get("target_page_indices")
+            if isinstance(explicit, list):
+                selected = []
+                for item in explicit:
+                    try:
+                        pi = int(item)
+                    except Exception:
+                        continue
+                    if pi in job.pages:
+                        selected.append(pi)
+                if selected:
+                    return sorted(dict.fromkeys(selected))
             return [action.page_index]
 
         strategy = plan.get("strategy_suggestions") if isinstance(plan.get("strategy_suggestions"), dict) else {}
@@ -272,6 +295,72 @@ class ComicAgent:
             selected = selected[:max_pages]
 
         return selected or [ref_page_index]
+
+    def _select_revision_target_pages(self, job: JobState, action: AgentAction, plan: Dict[str, Any], revision_mode: str) -> List[int]:
+        seed_pages = self._select_revision_seed_pages(job, action, plan, revision_mode)
+        strategy = plan.get("strategy_suggestions") if isinstance(plan.get("strategy_suggestions"), dict) else {}
+        scope = str((strategy or {}).get("revision_scope") or plan.get("scope") or "page_only").strip().lower()
+
+        if revision_mode != "auto_rag_revision" and scope != "global":
+            ref_page_index = seed_pages[0] if seed_pages else action.page_index
+            ref_page = job.pages.get(ref_page_index)
+            batch_range = getattr(ref_page, "vlm_batch_range", None) if ref_page is not None else None
+            if isinstance(batch_range, dict) and isinstance(batch_range.get("page_indices"), list):
+                selected = []
+                for item in batch_range.get("page_indices") or []:
+                    try:
+                        pi = int(item)
+                    except Exception:
+                        continue
+                    if pi in job.pages:
+                        selected.append(pi)
+                if selected:
+                    return sorted(dict.fromkeys(selected))
+            return seed_pages
+
+        if revision_mode == "auto_rag_revision":
+            return seed_pages
+
+        env_limit = max(1, int(os.getenv("MANGA_AGENT_REVISION_PRESELECT_PAGES", "24")))
+        suggested_limit = (strategy or {}).get("revision_page_limit")
+        try:
+            max_pages = min(env_limit, max(1, int(suggested_limit))) if suggested_limit is not None else env_limit
+        except Exception:
+            max_pages = env_limit
+
+        expanded: List[int] = []
+        for page_index in seed_pages:
+            page_state = job.pages.get(page_index)
+            batch_range = getattr(page_state, "vlm_batch_range", None) if page_state is not None else None
+            if isinstance(batch_range, dict) and isinstance(batch_range.get("page_indices"), list):
+                for item in batch_range.get("page_indices") or []:
+                    try:
+                        pi = int(item)
+                    except Exception:
+                        continue
+                    if pi in job.pages:
+                        expanded.append(pi)
+            elif page_index in job.pages:
+                expanded.append(page_index)
+
+        expanded = sorted(dict.fromkeys(expanded))
+        if len(expanded) > max_pages:
+            expanded = expanded[:max_pages]
+
+        return expanded or seed_pages
+
+    def _select_revision_apply_pages(self, job: JobState, action: AgentAction, plan: Dict[str, Any], revision_mode: str) -> List[int]:
+        if revision_mode == "auto_rag_revision":
+            return self._select_revision_target_pages(job, action, plan, revision_mode)
+
+        strategy = plan.get("strategy_suggestions") if isinstance(plan.get("strategy_suggestions"), dict) else {}
+        scope = str((strategy or {}).get("revision_scope") or plan.get("scope") or "page_only").strip().lower()
+        if scope != "global":
+            ref_page_index = self._resolve_plan_page_index(job, plan)
+            if ref_page_index is None:
+                ref_page_index = action.page_index
+            return [ref_page_index]
+        return self._select_revision_seed_pages(job, action, plan, revision_mode)
 
     def _target_pages_for_plan(self, job: JobState, plan: Dict[str, Any]) -> List[int]:
         page_index = self._resolve_plan_page_index(job, plan)
@@ -328,6 +417,233 @@ class ComicAgent:
                 self._apply_page_profile_presets(page, profile)
         return clean
 
+    def _apply_page_strategy_suggestions(
+        self,
+        page: PageState,
+        *,
+        strategy_suggestions: Dict[str, Any],
+        skill_param_suggestions: Dict[str, Dict[str, Any]],
+        summary: Optional[str],
+        confidence: Optional[float],
+        stage_label: str,
+    ) -> None:
+        had_actionable_update = bool(strategy_suggestions or skill_param_suggestions)
+        if strategy_suggestions:
+            merged_strategy = dict(page.strategy_suggestions or {})
+            merged_strategy.update(strategy_suggestions)
+            page.strategy_suggestions = merged_strategy
+            profile = strategy_suggestions.get("page_profile")
+            if isinstance(profile, str) and profile:
+                self._apply_page_profile_presets(page, profile)
+
+        for skill_name, params in (skill_param_suggestions or {}).items():
+            if isinstance(params, dict) and params:
+                self._merge_page_skill_params(page, skill_name, params)
+
+        if summary is not None:
+            clean_summary = summary.strip()
+            if clean_summary:
+                page.page_brain_summary = clean_summary
+                if had_actionable_update and clean_summary.lower() not in {"default page strategy", "no extra page strategy"}:
+                    page.page_brain_last_actionable_summary = clean_summary
+        page.page_brain_confidence = confidence
+        page.page_brain_stage_last = stage_label
+
+    def _page_range_from_indices(self, page_indices: List[int]) -> Dict[str, Any]:
+        ordered = sorted(int(x) for x in page_indices)
+        ranges = []
+        start = ordered[0]
+        prev = ordered[0]
+        for value in ordered[1:]:
+            if value == prev + 1:
+                prev = value
+                continue
+            ranges.append((start, prev))
+            start = value
+            prev = value
+        ranges.append((start, prev))
+        label = ",".join(f"{a}-{b}" if a != b else str(a) for a, b in ranges)
+        return {
+            "start_page_index": ordered[0],
+            "end_page_index": ordered[-1],
+            "page_count": len(ordered),
+            "page_indices": ordered,
+            "label": label,
+        }
+
+    def _apply_job_strategy_suggestions(
+        self,
+        job: JobState,
+        *,
+        strategy_suggestions: Dict[str, Any],
+        summary: Optional[str],
+        confidence: Optional[float],
+        stage_label: str,
+    ) -> None:
+        if strategy_suggestions:
+            merged = dict(job.job_strategy_suggestions or {})
+            merged.update(strategy_suggestions)
+            job.job_strategy_suggestions = merged
+            if "vlm_batch_size" in strategy_suggestions:
+                try:
+                    job.vlm_batch_size = max(1, min(10, int(strategy_suggestions["vlm_batch_size"])))
+                except Exception:
+                    pass
+
+        if summary is not None and str(summary).strip():
+            job.job_brain_summary = str(summary).strip()
+        job.job_brain_confidence = confidence
+        job.job_brain_stage_last = stage_label
+
+    def _build_job_summary_for_brain(self, job: JobState) -> Dict[str, Any]:
+        pages_sorted = [job.pages[pi] for pi in sorted(job.pages.keys())]
+        stage_counts: Dict[str, int] = {}
+        for page in pages_sorted:
+            stage_counts[page.stage.value] = stage_counts.get(page.stage.value, 0) + 1
+
+        active_stages = {
+            PageStage.DETECTED,
+            PageStage.OCR_DONE,
+            PageStage.TRANSLATED,
+            PageStage.REVISING,
+            PageStage.ERASING,
+            PageStage.ERASED,
+            PageStage.TYPESETTING,
+            PageStage.TRANSLATING,
+            PageStage.DETECTING,
+            PageStage.OCRING,
+        }
+        active_page_indices = [page.page_index for page in pages_sorted if page.stage in active_stages]
+        next_not_started_page_indices = [page.page_index for page in pages_sorted if page.stage == PageStage.NOT_STARTED]
+
+        return {
+            "job_id": job.job_id,
+            "page_count": len(job.pages),
+            "status": job.status.value,
+            "preferred_vlm_batch_size": max(1, min(10, int(getattr(job, "vlm_batch_size", 10) or 10))),
+            "stage_counts": stage_counts,
+            "active_page_count": len(active_page_indices),
+            "active_page_indices": active_page_indices[:20],
+            "next_not_started_page_indices": next_not_started_page_indices[:10],
+            "completed_vlm_batches": len(getattr(job, "vlm_batches", []) or []),
+            "completed_revision_batches": len(getattr(job, "revision_batches", []) or []),
+            "current_job_strategy": dict(job.job_strategy_suggestions or {}),
+        }
+
+    def _refresh_job_brain_strategy(self, job: JobState, *, trigger: str) -> None:
+        if not hasattr(self.brain, "suggest_job_strategy"):
+            return
+        try:
+            suggested = self.brain.suggest_job_strategy(
+                job_summary=self._build_job_summary_for_brain(job),
+                pipeline_mode=str(job.user_preferences.get("pipeline_mode") or "classic").lower(),
+                target_language=job.target_language,
+                skill_context=build_skill_context_for_brain(),
+            )
+        except Exception as e:
+            job.logs.append(f"Job strategy brain failed: {e}")
+            return
+
+        clean_strategy = sanitize_job_strategy_suggestions((suggested or {}).get("strategy_suggestions"))
+        summary = suggested.get("summary") if isinstance(suggested, dict) else None
+        if not isinstance(summary, str):
+            summary = None
+        confidence = None
+        if isinstance(suggested, dict):
+            try:
+                confidence = float(suggested.get("confidence")) if suggested.get("confidence") is not None else None
+            except Exception:
+                confidence = None
+
+        self._apply_job_strategy_suggestions(
+            job,
+            strategy_suggestions=clean_strategy,
+            summary=summary,
+            confidence=confidence,
+            stage_label=trigger,
+        )
+
+    def _build_page_summary_for_brain(self, page: PageState) -> Dict[str, Any]:
+        regions = list(page.regions.values())
+        total_regions = len(regions)
+        boxed_regions = sum(1 for r in regions if r.has_text_box is True)
+        embedded_regions = sum(1 for r in regions if r.has_text_box is False)
+        empty_tgt_regions = sum(1 for r in regions if not str(r.translated_text or "").strip())
+        overflow_regions = sum(1 for r in regions if bool(r.render_overflow))
+        bad_render_regions = sum(1 for r in regions if (not r.render_ok) or bool(r.render_overflow))
+        embedded_ratio = (embedded_regions / float(total_regions)) if total_regions else 0.0
+
+        return {
+            "page_index": page.page_index,
+            "page_type": page.page_type,
+            "stage": page.stage.value,
+            "regions_total": total_regions,
+            "boxed_regions": boxed_regions,
+            "embedded_regions": embedded_regions,
+            "embedded_ratio": embedded_ratio,
+            "empty_tgt_regions": empty_tgt_regions,
+            "overflow_regions": overflow_regions,
+            "bad_render_regions": bad_render_regions,
+            "vlm_quality_ok": page.vlm_quality_ok,
+            "vlm_quality_reason": page.vlm_quality_reason,
+            "vlm_judge_decision": page.vlm_judge_decision,
+            "vlm_judge_reason_code": page.vlm_judge_reason_code,
+            "retry_count_vlm": page.retry_count_vlm,
+            "auto_revision_done": page.auto_revision_done,
+            "auto_revision_changed": page.auto_revision_changed,
+            "erase_ok": page.erase_ok,
+            "erase_backend": page.erase_backend,
+            "erase_metrics": page.erase_metrics or {},
+            "erase_mask_quality": ((page.erase_metrics or {}).get("mask_quality")),
+            "erase_mask_quality_reason": ((page.erase_metrics or {}).get("mask_quality_reason")),
+            "erase_mask_strategy": ((page.erase_metrics or {}).get("mask_strategy")),
+            "erase_mask_coverage": ((page.erase_metrics or {}).get("mask_coverage")),
+            "erase_embedded_regions": ((page.erase_metrics or {}).get("embedded_regions")),
+            "erase_mask_retry_hint": ((page.erase_metrics or {}).get("mask_retry_hint") or {}),
+            "lettering_ok": page.lettering_ok,
+            "typeset_metrics": page.typeset_metrics or {},
+            "retry_count_erase": page.retry_count_erase,
+            "has_erased_image": bool(page.erased_image_ref),
+            "has_rendered_image": bool(page.rendered_image_ref),
+            "current_strategy_suggestions": dict(page.strategy_suggestions or {}),
+            "current_skill_param_suggestions": dict(page.skill_param_suggestions or {}),
+        }
+
+    def _refresh_page_brain_strategy(self, job: JobState, page: PageState, *, trigger: str) -> None:
+        if not hasattr(self.brain, "suggest_page_strategy"):
+            return
+        try:
+            suggested = self.brain.suggest_page_strategy(
+                page_summary=self._build_page_summary_for_brain(page),
+                pipeline_mode=str(job.user_preferences.get("pipeline_mode") or "classic").lower(),
+                target_language=job.target_language,
+                skill_context=build_skill_context_for_brain(),
+            )
+        except Exception as e:
+            job.logs.append(f"Page strategy brain failed on page {page.page_index}: {e}")
+            return
+
+        clean_strategy = sanitize_strategy_suggestions((suggested or {}).get("strategy_suggestions"))
+        clean_skills = sanitize_skill_param_suggestions((suggested or {}).get("skill_param_suggestions"))
+        summary = suggested.get("summary") if isinstance(suggested, dict) else None
+        if not isinstance(summary, str):
+            summary = None
+        confidence = None
+        if isinstance(suggested, dict):
+            try:
+                confidence = float(suggested.get("confidence")) if suggested.get("confidence") is not None else None
+            except Exception:
+                confidence = None
+
+        self._apply_page_strategy_suggestions(
+            page,
+            strategy_suggestions=clean_strategy,
+            skill_param_suggestions=clean_skills,
+            summary=summary,
+            confidence=confidence,
+            stage_label=trigger,
+        )
+
     # -----------------------------------------------------
     # 对外接口 1：创建任务
     # -----------------------------------------------------
@@ -353,6 +669,7 @@ class ComicAgent:
             source_file_name=source_file_name,
             target_language=target_language,
             status=JobStatus.CREATED,
+            vlm_batch_size=max(1, min(10, int(os.getenv("MANGA_AGENT_VLM_BATCH_SIZE", "10")))),
         )
 
         # Initialize glossary bucket for in-job corrections (RAG / translation memory).
@@ -495,6 +812,7 @@ class ComicAgent:
 
         for _ in range(int(max_steps)):
             job = self.store.get_job(job_id)
+            self._refresh_job_brain_strategy(job, trigger="before_decision")
             action = self.decision_engine.decide_next_action(job)
             self._log(job, f"Decision: {action.action_type.value}, reason={action.reason}")
 
@@ -542,6 +860,12 @@ class ComicAgent:
     # 内部：执行具体动作
     # -----------------------------------------------------
     def _execute_action(self, job: JobState, action: AgentAction) -> None:
+        if action.action_type == ActionType.RUN_VLM_BATCH:
+            page_indices = [int(x) for x in (action.payload.get("page_indices") or [])]
+            target_language = action.payload.get("target_language", job.target_language)
+            self._do_vlm_batch(job, page_indices=page_indices, target_language=target_language)
+            return
+
         if action.page_index is None:
             raise ValueError("Page-level action must include page_index.")
 
@@ -610,9 +934,16 @@ class ComicAgent:
         plan = action.payload or {}
         revision_mode = str(plan.get("revision_mode") or "user_feedback_revision").strip().lower()
         page = job.pages[action.page_index]
-        page.stage = PageStage.REVISING
 
         target_page_indices = self._select_revision_target_pages(job, action, plan, revision_mode)
+        apply_page_indices = self._select_revision_apply_pages(job, action, plan, revision_mode)
+        stage_before_revision = {pi: job.pages[pi].stage for pi in target_page_indices if pi in job.pages}
+        for pi in target_page_indices:
+            if pi in job.pages:
+                job.pages[pi].stage = PageStage.REVISING
+        document_range = plan.get("document_range") if isinstance(plan.get("document_range"), dict) else None
+        if not isinstance(document_range, dict):
+            document_range = self._page_range_from_indices(target_page_indices)
         pages_payload: List[Dict[str, Any]] = []
         for page_index in target_page_indices:
             page_state = job.pages[page_index]
@@ -624,24 +955,37 @@ class ComicAgent:
                         "region_id": r.region_id,
                         "bbox_xywh": r.bbox,
                         "has_text_box": r.has_text_box,
+                        "color": r.color,
                         "src_text": r.ocr_text or "",
                         "tgt_text": r.translated_text or "",
                     }
                 )
-            pages_payload.append({"page_index": page_index, "regions": regions_payload})
+            pages_payload.append(
+                {
+                    "page_index": page_index,
+                    "page_type": page_state.page_type,
+                    "regions": regions_payload,
+                }
+            )
 
         reading_direction = str(job.user_preferences.get("reading_direction") or "ltr")
-        retrieval_context = self.memory.build_revision_retrieval(job, page)
+        retrieval_context = self.memory.build_revision_retrieval(
+            job,
+            pages=[job.pages[pi] for pi in target_page_indices if pi in job.pages],
+            document_range=document_range,
+        )
         user_request = str(plan.get("user_message") or plan.get("raw") or "")
         if revision_mode == "auto_rag_revision":
             user_request = user_request or "Apply one automatic RAG-guided consistency pass to this page."
 
         result = self.tools.run_vlm_translation_revision(
             pages=pages_payload,
+            document_range=document_range,
             revision_mode=revision_mode,
             user_request=user_request,
             reference_page_number=plan.get("reference_page_number"),
             scope=str(plan.get("scope") or "page_only"),
+            apply_page_indices=apply_page_indices,
             from_side=str(plan.get("from_side") or "auto"),
             from_text=plan.get("from_text"),
             to_text=plan.get("to_text"),
@@ -654,17 +998,27 @@ class ComicAgent:
         if not result.get("ok"):
             err = result.get("error") or {}
             if revision_mode == "auto_rag_revision":
-                page.stage = PageStage.TRANSLATED
-                page.auto_revision_done = True
-                page.auto_revision_changed = False
-                page.revision_mode_last = revision_mode
-                page.revision_warnings = [f"{err.get('code') or 'revision_failed'}: {err.get('message') or 'unknown'}"]
-                page.revision_usage = (result.get("metrics") or {}).get("usage")
-                job.logs.append(f"Auto revision skipped on page {page.page_index}: {err.get('code')} {err.get('message')}")
+                usage = (result.get("metrics") or {}).get("usage")
+                for pi in target_page_indices:
+                    if pi not in job.pages:
+                        continue
+                    target_page = job.pages[pi]
+                    target_page.stage = PageStage.TRANSLATED
+                    target_page.auto_revision_done = True
+                    target_page.auto_revision_changed = False
+                    target_page.revision_mode_last = revision_mode
+                    target_page.revision_warnings = [f"{err.get('code') or 'revision_failed'}: {err.get('message') or 'unknown'}"]
+                    target_page.revision_usage = usage if isinstance(usage, dict) else None
+                    target_page.revision_batch_range = dict(document_range)
+                job.logs.append(
+                    f"Auto revision skipped on pages {target_page_indices}: {err.get('code')} {err.get('message')}"
+                )
                 return
 
             job.pending_user_plan = None
-            page.stage = PageStage.TRANSLATED
+            for pi in target_page_indices:
+                if pi in job.pages:
+                    job.pages[pi].stage = PageStage.TRANSLATED
             job.logs.append(f"Revision failed: {err.get('code')} {err.get('message')}")
             job.status = JobStatus.WAITING_USER
             job.waiting_reason = f"Revision failed: {err.get('message') or err.get('code') or 'unknown'}"
@@ -674,28 +1028,52 @@ class ComicAgent:
         decision = str(data.get("decision") or "apply").strip().lower()
         if decision == "ask_user":
             if revision_mode == "auto_rag_revision":
-                page.stage = PageStage.TRANSLATED
-                page.auto_revision_done = True
-                page.auto_revision_changed = False
-                page.revision_mode_last = revision_mode
-                page.revision_warnings = [str(data.get("ask_user") or "auto revision skipped")]
-                page.revision_usage = (result.get("metrics") or {}).get("usage")
-                job.logs.append(f"Auto revision skipped on page {page.page_index}: {data.get('ask_user')}")
+                usage = (result.get("metrics") or {}).get("usage")
+                for pi in target_page_indices:
+                    if pi not in job.pages:
+                        continue
+                    target_page = job.pages[pi]
+                    target_page.stage = PageStage.TRANSLATED
+                    target_page.auto_revision_done = True
+                    target_page.auto_revision_changed = False
+                    target_page.revision_mode_last = revision_mode
+                    target_page.revision_warnings = [str(data.get("ask_user") or "auto revision skipped")]
+                    target_page.revision_usage = usage if isinstance(usage, dict) else None
+                    target_page.revision_batch_range = dict(document_range)
+                job.logs.append(f"Auto revision skipped on pages {target_page_indices}: {data.get('ask_user')}")
                 return
 
             q = str(data.get("ask_user") or "Please clarify your correction request.").strip()
-            page.stage = PageStage.TRANSLATED
+            for pi in target_page_indices:
+                if pi in job.pages:
+                    job.pages[pi].stage = PageStage.TRANSLATED
             job.pending_user_plan = plan
             job.pending_user_plan["needs_clarification"] = True
             job.pending_user_plan["clarifying_question"] = q
             return
 
-        pages_out = data.get("pages") or []
-        changed_pages = set(int(x) for x in (data.get("changed_pages") or []) if str(x).strip().isdigit())
-        patches = [x for x in (data.get("patches") or []) if isinstance(x, dict)]
+        returned_document_range = data.get("document_range") if isinstance(data.get("document_range"), dict) else None
+        if isinstance(returned_document_range, dict):
+            document_range = returned_document_range
+        allowed_apply_page_set = {int(x) for x in apply_page_indices}
+        pages_out = [
+            p for p in (data.get("pages") or [])
+            if isinstance(p, dict) and str(p.get("page_index")).strip().isdigit() and int(p.get("page_index")) in allowed_apply_page_set
+        ]
+        changed_pages = set(
+            int(x) for x in (data.get("changed_pages") or [])
+            if str(x).strip().isdigit() and int(x) in allowed_apply_page_set
+        )
+        patches = [
+            x for x in (data.get("patches") or [])
+            if isinstance(x, dict) and str(x.get("page_index")).strip().isdigit() and int(x.get("page_index")) in allowed_apply_page_set
+        ]
         glossary_updates = [x for x in (data.get("glossary_updates") or []) if isinstance(x, dict)]
         warnings = [str(x) for x in (data.get("warnings") or []) if str(x).strip()]
         usage = (result.get("metrics") or {}).get("usage")
+        for pi in target_page_indices:
+            if pi in job.pages:
+                job.pages[pi].revision_batch_range = dict(document_range)
 
         # Merge tgt_text back into state.
         changed_regions = 0
@@ -712,6 +1090,9 @@ class ComicAgent:
                 continue
 
             page = job.pages[pi]
+            returned_page_type = str(p.get("page_type") or page.page_type or "content").strip().lower()
+            if returned_page_type in {"cover", "info", "content"}:
+                page.page_type = returned_page_type
             for r in p.get("regions", []) or []:
                 try:
                     rid = int(r.get("region_id"))
@@ -724,6 +1105,7 @@ class ComicAgent:
                     continue
 
                 region = page.regions[rid]
+                region.color = str(r.get("color") or region.color or "black")
                 if (region.translated_text or "") != new_tgt:
                     region.translated_text = new_tgt
                     region.stage = RegionStage.TRANSLATED
@@ -753,6 +1135,18 @@ class ComicAgent:
                 glossary_type=(plan.get("glossary_type") if isinstance(plan, dict) else None),
             )
 
+        job.revision_batches.append(
+            {
+                "revision_mode": revision_mode,
+                "page_range": dict(document_range),
+                "candidate_pages": len(target_page_indices),
+                "changed_pages": sorted(changed_pages),
+                "patch_count": len(patches),
+                "warnings": warnings,
+                "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            }
+        )
+
         # Re-run lettering on changed pages.
         for pi in changed_pages:
             if pi in job.pages:
@@ -762,19 +1156,29 @@ class ComicAgent:
                 job.pages[pi].rendered_image_ref = None
 
         if revision_mode == "auto_rag_revision":
-            page.auto_revision_done = True
-            page.auto_revision_changed = bool(changed_regions)
-            page.revision_mode_last = revision_mode
-            page.revision_warnings = warnings
-            page.revision_usage = usage if isinstance(usage, dict) else None
-            if page.stage == PageStage.REVISING:
-                page.stage = PageStage.TRANSLATED
+            for pi in target_page_indices:
+                if pi not in job.pages:
+                    continue
+                target_page = job.pages[pi]
+                target_page.auto_revision_done = True
+                target_page.auto_revision_changed = bool(pi in changed_pages)
+                target_page.revision_mode_last = revision_mode
+                target_page.revision_warnings = warnings
+                target_page.revision_usage = usage if isinstance(usage, dict) else None
+                if target_page.stage == PageStage.REVISING:
+                    target_page.stage = PageStage.TRANSLATED
         else:
             for pi in target_page_indices:
                 if pi in job.pages:
                     job.pages[pi].auto_revision_done = True
+                    job.pages[pi].auto_revision_changed = bool(pi in changed_pages)
                     job.pages[pi].revision_mode_last = revision_mode
                     job.pages[pi].revision_usage = usage if isinstance(usage, dict) else None
+                    if job.pages[pi].stage == PageStage.REVISING:
+                        if pi in changed_pages:
+                            job.pages[pi].stage = PageStage.TRANSLATED
+                        else:
+                            job.pages[pi].stage = stage_before_revision.get(pi, PageStage.TRANSLATED)
             job.pending_user_plan = None
 
         job.logs.append(
@@ -811,8 +1215,7 @@ class ComicAgent:
 
         self._log(job, f"Page {page.page_index}: detection done, regions={page.detection_count}")
 
-    def _do_vlm_page(self, job: JobState, page: PageState, target_language: str, retry: bool) -> None:
-        # VLM core does: detect regions + OCR + translate.
+    def _prepare_page_for_vlm_attempt(self, page: PageState, *, retry: bool) -> None:
         page.stage = PageStage.TRANSLATING
 
         # Reset QA fields per attempt (avoid carrying judge results across retries).
@@ -830,28 +1233,18 @@ class ComicAgent:
         if retry:
             page.retry_count_vlm += 1
 
-        reading_direction = str(job.user_preferences.get("reading_direction") or "ltr")
-        source_language = str(job.user_preferences.get("source_language") or "en")
-
-        result = self.tools.run_vlm_page(
-            page,
-            reading_direction=reading_direction,
-            source_language=source_language,
-            target_language=target_language,
-            force_fullres=retry,
-            retrieval_context=self.memory.build_vlm_retrieval(job, page),
-        )
-
-        if not result.get("ok"):
-            page.stage = PageStage.FAILED
-            page.page_error_message = "VLM core failed."
-            page.vlm_quality_ok = False
-            err = result.get("error") or {}
-            page.vlm_quality_reason = str(err.get("code") or "vlm_failed")
-            page.vlm_warnings = [str(err.get("message") or "VLM core failed")]
-            self._log(job, f"Page {page.page_index}: VLM core failed.")
-            return
-
+    def _apply_vlm_success_to_page(
+        self,
+        job: JobState,
+        page: PageState,
+        *,
+        result: Dict[str, Any],
+        target_language: str,
+        reading_direction: str,
+        source_language: str,
+        batch_range: Optional[Dict[str, Any]] = None,
+        batch_id: Optional[str] = None,
+    ) -> None:
         page.regions.clear()
         for item in result.get("regions", []) or []:
             region_id = int(item["region_id"])
@@ -860,11 +1253,16 @@ class ComicAgent:
                 bbox=item.get("bbox"),
                 region_type=item.get("region_type", "text"),
                 has_text_box=item.get("has_text_box"),
+                color=str(item.get("color") or "black"),
                 ocr_text=item.get("src_text"),
                 translated_text=item.get("tgt_text"),
                 stage=RegionStage.TRANSLATED,
             )
 
+        page_type = str(result.get("page_type") or "content").strip().lower()
+        if page_type not in {"cover", "info", "content"}:
+            page_type = "content"
+        page.page_type = page_type
         page.detection_ok = True
         page.detection_count = len(page.regions)
         page.bbox_error = bool(result.get("bbox_error", False))
@@ -877,27 +1275,47 @@ class ComicAgent:
         page.revision_usage = None
         page.erase_ok = False
         page.erase_backend = None
+        page.erase_metrics = None
         page.erased_image_ref = None
         page.rendered_image_ref = None
         page.lettering_ok = False
+        page.typeset_metrics = None
         page.stage = PageStage.TRANSLATED
         page.needs_manual_rerun = False
+        page.vlm_batch_range = dict(batch_range) if isinstance(batch_range, dict) else None
+        page.vlm_batch_id = batch_id
 
-        # Record VLM metrics for later QA/debug.
         vm = result.get("vlm_metrics") or {}
         page.vlm_orig_size = list(vm.get("orig") or []) or None
         page.vlm_sent_size = list(vm.get("sent") or []) or None
         page.vlm_downscaled = vm.get("downscaled") if vm.get("downscaled") is not None else None
         page.vlm_usage = vm.get("usage") if isinstance(vm.get("usage"), dict) else None
 
-        # Evaluate quality. If not ok, DecisionEngine may trigger a retry.
+        if page.page_type in {"cover", "info"}:
+            page.vlm_quality_ok = True
+            page.vlm_quality_reason = None
+            page.vlm_warnings = [f"Skipped OCR/translation post-processing for page_type={page.page_type}."]
+            page.vlm_judge_decision = "proceed"
+            page.vlm_judge_reason_code = "non_content_page"
+            page.vlm_judge_explanation = f"Page classified as {page.page_type}; downstream text pipeline skipped."
+            page.vlm_judge_confidence = 1.0
+            page.vlm_judge_warnings = []
+            page.vlm_judge_usage = None
+            page.rendered_image_ref = page.image_ref
+            page.lettering_ok = True
+            page.stage = PageStage.DONE
+            self._log(
+                job,
+                f"Page {page.page_index}: classified as {page.page_type}; skipped revision/erase/typeset.",
+            )
+            self._refresh_page_brain_strategy(job, page, trigger="after_vlm_page")
+            return
+
         q_ok, q_reason, q_warn = self._evaluate_vlm_page_quality(job, page, target_language=target_language)
         page.vlm_quality_ok = q_ok
         page.vlm_quality_reason = q_reason
         page.vlm_warnings = q_warn
 
-        # Hybrid policy: obvious failures are handled by heuristics above;
-        # non-obvious cases go to a text-only LLM judge (no image upload).
         if page.vlm_quality_ok:
             try:
                 regions_sorted = sorted(page.regions.values(), key=lambda r: r.region_id)
@@ -981,9 +1399,10 @@ class ComicAgent:
         usage_str = ""
         if isinstance(usage, dict) and any(usage.get(k) is not None for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
             usage_str = f" usage={usage}"
+        batch_note = f" batch={batch_range.get('label')}" if isinstance(batch_range, dict) else ""
         self._log(
             job,
-            f"Page {page.page_index}: VLM core done, regions={page.detection_count}, orig={vm.get('orig')} sent={vm.get('sent')} downscaled={vm.get('downscaled')}{usage_str}",
+            f"Page {page.page_index}: VLM core done, regions={page.detection_count}, orig={vm.get('orig')} sent={vm.get('sent')} downscaled={vm.get('downscaled')}{usage_str}{batch_note}",
         )
 
         if page.vlm_judge_decision in {"retry", "ask_user"}:
@@ -998,6 +1417,128 @@ class ComicAgent:
                 f"Page {page.page_index}: VLM quality not ok: {page.vlm_quality_reason} warnings={page.vlm_warnings}",
             )
 
+        self._refresh_page_brain_strategy(job, page, trigger="after_vlm_page")
+
+    def _do_vlm_page(self, job: JobState, page: PageState, target_language: str, retry: bool) -> None:
+        # VLM core does: detect regions + OCR + translate.
+        self._prepare_page_for_vlm_attempt(page, retry=retry)
+
+        reading_direction = str(job.user_preferences.get("reading_direction") or "ltr")
+        source_language = str(job.user_preferences.get("source_language") or "en")
+
+        result = self.tools.run_vlm_page(
+            page,
+            reading_direction=reading_direction,
+            source_language=source_language,
+            target_language=target_language,
+            force_fullres=retry,
+            retrieval_context=self.memory.build_vlm_retrieval(job, page),
+        )
+
+        if not result.get("ok"):
+            page.stage = PageStage.FAILED
+            page.page_error_message = "VLM core failed."
+            page.vlm_quality_ok = False
+            err = result.get("error") or {}
+            page.vlm_quality_reason = str(err.get("code") or "vlm_failed")
+            page.vlm_warnings = [str(err.get("message") or "VLM core failed")]
+            self._log(job, f"Page {page.page_index}: VLM core failed.")
+            return
+
+        self._apply_vlm_success_to_page(
+            job,
+            page,
+            result=result,
+            target_language=target_language,
+            reading_direction=reading_direction,
+            source_language=source_language,
+        )
+
+    def _do_vlm_batch(self, job: JobState, *, page_indices: List[int], target_language: str) -> None:
+        if not page_indices:
+            return
+
+        ordered_indices = [pi for pi in sorted(dict.fromkeys(page_indices)) if pi in job.pages]
+        if not ordered_indices:
+            return
+
+        pages = [job.pages[pi] for pi in ordered_indices]
+        for page in pages:
+            self._prepare_page_for_vlm_attempt(page, retry=False)
+
+        reading_direction = str(job.user_preferences.get("reading_direction") or "ltr")
+        source_language = str(job.user_preferences.get("source_language") or "en")
+        retrieval_contexts = {page.page_index: self.memory.build_vlm_retrieval(job, page) for page in pages}
+
+        result = self.tools.run_vlm_pages(
+            pages,
+            reading_direction=reading_direction,
+            source_language=source_language,
+            target_language=target_language,
+            retrieval_contexts=retrieval_contexts,
+        )
+
+        batch_range = result.get("page_range") if isinstance(result.get("page_range"), dict) else self._page_range_from_indices(ordered_indices)
+        batch_id = f"vlm:{batch_range['label']}:{int(time.time() * 1000)}"
+
+        if not result.get("ok"):
+            err = result.get("error") or {}
+            for page in pages:
+                page.stage = PageStage.FAILED
+                page.page_error_message = "VLM batch failed."
+                page.vlm_quality_ok = False
+                page.vlm_quality_reason = str(err.get("code") or "vlm_batch_failed")
+                page.vlm_warnings = [str(err.get("message") or "VLM batch failed")]
+                page.vlm_batch_range = dict(batch_range)
+                page.vlm_batch_id = batch_id
+            self._log(job, f"VLM batch {batch_range.get('label')}: failed code={err.get('code')} msg={err.get('message')}")
+            return
+
+        pages_out = result.get("pages") or []
+        pages_by_index = {}
+        for item in pages_out:
+            if not isinstance(item, dict):
+                continue
+            try:
+                pages_by_index[int(item.get("page_index"))] = item
+            except Exception:
+                continue
+
+        batch_metrics = result.get("batch_metrics") if isinstance(result.get("batch_metrics"), dict) else {}
+        job.vlm_batches.append(
+            {
+                "batch_id": batch_id,
+                "page_range": dict(batch_range),
+                "page_indices": list(batch_range.get("page_indices") or ordered_indices),
+                "metrics": batch_metrics,
+                "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            }
+        )
+
+        for page in pages:
+            page_result = pages_by_index.get(page.page_index)
+            if not isinstance(page_result, dict):
+                page.stage = PageStage.FAILED
+                page.page_error_message = "VLM batch missing page result."
+                page.vlm_quality_ok = False
+                page.vlm_quality_reason = "vlm_batch_missing_page_result"
+                page.vlm_warnings = ["VLM batch did not return this page."]
+                page.vlm_batch_range = dict(batch_range)
+                page.vlm_batch_id = batch_id
+                self._log(job, f"Page {page.page_index}: missing from VLM batch result.")
+                continue
+
+            self._apply_vlm_success_to_page(
+                job,
+                page,
+                result=page_result,
+                target_language=target_language,
+                reading_direction=reading_direction,
+                source_language=source_language,
+                batch_range=batch_range,
+                batch_id=batch_id,
+            )
+
     def _evaluate_vlm_page_quality(self, job: JobState, page: PageState, *, target_language: str) -> tuple[bool, Optional[str], list[str]]:
         """Heuristic quality gate for VLM results.
 
@@ -1009,6 +1550,98 @@ class ComicAgent:
         warnings: list[str] = []
         regions = list(page.regions.values())
         n = len(regions)
+
+        if getattr(page, "page_type", "content") in {"cover", "info"}:
+            return True, None, warnings
+
+        def _bbox_iou(a: list[int], b: list[int]) -> float:
+            ax, ay, aw, ah = a
+            bx, by, bw, bh = b
+            ax2, ay2 = ax + aw, ay + ah
+            bx2, by2 = bx + bw, by + bh
+            ix1 = max(ax, bx)
+            iy1 = max(ay, by)
+            ix2 = min(ax2, bx2)
+            iy2 = min(ay2, by2)
+            iw = max(0, ix2 - ix1)
+            ih = max(0, iy2 - iy1)
+            inter = iw * ih
+            if inter <= 0:
+                return 0.0
+            union = (aw * ah) + (bw * bh) - inter
+            if union <= 0:
+                return 0.0
+            return inter / float(union)
+
+        def _bbox_quality_signals() -> tuple[list[str], Optional[str]]:
+            size = page.vlm_orig_size or []
+            if not (isinstance(size, list) and len(size) == 2 and all(isinstance(x, int) and x > 0 for x in size)):
+                return [], None
+
+            page_w, page_h = int(size[0]), int(size[1])
+            page_area = float(page_w * page_h)
+            boxed_infos: list[dict[str, Any]] = []
+            suspicious_messages: list[str] = []
+            hard_fail = False
+
+            for region in regions:
+                bbox = region.bbox
+                if not (isinstance(bbox, list) and len(bbox) == 4):
+                    continue
+                try:
+                    x, y, w, h = [int(round(float(v))) for v in bbox]
+                except Exception:
+                    continue
+                if w <= 0 or h <= 0:
+                    continue
+                area = float(w * h)
+                area_ratio = area / page_area if page_area > 0 else 0.0
+                src = str(region.ocr_text or "").strip()
+                tgt = str(region.translated_text or "").strip()
+                char_count = max(len(src), len(tgt))
+                chars_per_10k = (char_count * 10000.0 / area) if area > 0 else 0.0
+                boxed = region.has_text_box is not False
+
+                if boxed:
+                    boxed_infos.append(
+                        {
+                            "region_id": region.region_id,
+                            "bbox": [x, y, w, h],
+                            "area_ratio": area_ratio,
+                            "char_count": char_count,
+                            "chars_per_10k": chars_per_10k,
+                        }
+                    )
+
+                    if area_ratio >= 0.05 and char_count <= 80 and chars_per_10k < 3.0:
+                        suspicious_messages.append(
+                            f"r{region.region_id} boxed bbox is too large for its text (area={area_ratio:.3f}, chars={char_count}, density={chars_per_10k:.2f}/10k)."
+                        )
+                        hard_fail = True
+                    elif area_ratio >= 0.035 and char_count <= 48 and chars_per_10k < 2.2:
+                        suspicious_messages.append(
+                            f"r{region.region_id} boxed bbox looks loose (area={area_ratio:.3f}, chars={char_count}, density={chars_per_10k:.2f}/10k)."
+                        )
+
+            for idx in range(len(boxed_infos)):
+                for jdx in range(idx + 1, len(boxed_infos)):
+                    a = boxed_infos[idx]
+                    b = boxed_infos[jdx]
+                    iou = _bbox_iou(a["bbox"], b["bbox"])
+                    if iou < 0.55:
+                        continue
+                    if (
+                        a["area_ratio"] >= 0.04
+                        and b["area_ratio"] >= 0.04
+                        and a["chars_per_10k"] < 4.0
+                        and b["chars_per_10k"] < 4.0
+                    ):
+                        suspicious_messages.append(
+                            f"r{a['region_id']} and r{b['region_id']} have highly-overlapping oversized boxed bboxes (IoU={iou:.2f})."
+                        )
+                        hard_fail = True
+
+            return suspicious_messages, ("suspicious_bbox_geometry" if hard_fail else None)
 
         def _has_cjk(s: str) -> bool:
             for ch in s:
@@ -1035,6 +1668,12 @@ class ComicAgent:
 
             # Could be a full-art / no-text page.
             return True, None, warnings
+
+        bbox_warnings, bbox_reason = _bbox_quality_signals()
+        if bbox_warnings:
+            warnings.extend(bbox_warnings)
+        if bbox_reason is not None:
+            return False, bbox_reason, warnings
 
         src_nonempty = 0
         tgt_nonempty = 0
@@ -1124,10 +1763,12 @@ class ComicAgent:
         page.revision_usage = None
         page.erase_ok = False
         page.erase_backend = None
+        page.erase_metrics = None
         page.erased_image_ref = None
         page.stage = PageStage.TRANSLATED
         page.rendered_image_ref = None
         page.lettering_ok = False
+        page.typeset_metrics = None
 
         self._log(job, f"Page {page.page_index}: translation done, consistent={page.translation_consistent}")
 
@@ -1149,9 +1790,11 @@ class ComicAgent:
 
         page.erase_ok = True
         page.erase_backend = result.get("erase_backend")
+        page.erase_metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else None
         page.stage = PageStage.ERASED
         page.rendered_image_ref = None
         self._log(job, f"Page {page.page_index}: erase done, backend={page.erase_backend}, params={skill_params or {}}")
+        self._refresh_page_brain_strategy(job, page, trigger="after_erase")
 
     def _do_typeset(self, job: JobState, page: PageState, retry: bool, skill_params: Optional[Dict[str, Any]] = None) -> None:
         page.stage = PageStage.TYPESETTING
@@ -1178,9 +1821,11 @@ class ComicAgent:
                 all_ok = False
 
         page.lettering_ok = all_ok
+        page.typeset_metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else None
         page.stage = PageStage.TYPESETTING
 
         self._log(job, f"Page {page.page_index}: typesetting done, all_ok={all_ok}, params={skill_params or {}}")
+        self._refresh_page_brain_strategy(job, page, trigger="after_typeset")
 
     # -----------------------------------------------------
     # 工具：日志

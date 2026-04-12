@@ -43,6 +43,7 @@ class ActionType(str, Enum):
     RUN_OCR = "run_ocr"
     RUN_TRANSLATION = "run_translation"
     RUN_VLM_PAGE = "run_vlm_page"
+    RUN_VLM_BATCH = "run_vlm_batch"
     RUN_REVISION = "run_revision"
     RUN_ERASE = "run_erase"
     RUN_TYPESET = "run_typeset"
@@ -70,6 +71,7 @@ class RegionState:
     bbox: Optional[List[int]] = None  # [x, y, w, h]
     region_type: str = "text"
     has_text_box: Optional[bool] = None
+    color: str = "black"
 
     ocr_text: Optional[str] = None
     ocr_confidence: Optional[float] = None
@@ -98,11 +100,19 @@ class PageState:
     image_ref: Optional[str] = None  # 文件路径、对象存储 key、数据库引用等
     erased_image_ref: Optional[str] = None  # path to inpainted page image (if available)
     rendered_image_ref: Optional[str] = None  # path to rendered page image (if available)
+    page_type: str = "content"  # cover|info|content
 
     stage: PageStage = PageStage.NOT_STARTED
     regions: Dict[int, RegionState] = field(default_factory=dict)
     skill_param_suggestions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     strategy_suggestions: Dict[str, Any] = field(default_factory=dict)
+    page_brain_summary: Optional[str] = None
+    page_brain_last_actionable_summary: Optional[str] = None
+    page_brain_confidence: Optional[float] = None
+    page_brain_stage_last: Optional[str] = None
+    vlm_batch_id: Optional[str] = None
+    vlm_batch_range: Optional[Dict[str, Any]] = None
+    revision_batch_range: Optional[Dict[str, Any]] = None
 
     # 页面级质量指标
     detection_ok: bool = False
@@ -137,7 +147,9 @@ class PageState:
     revision_usage: Optional[Dict[str, Any]] = None
     erase_ok: bool = False
     erase_backend: Optional[str] = None
+    erase_metrics: Optional[Dict[str, Any]] = None
     lettering_ok: bool = False
+    typeset_metrics: Optional[Dict[str, Any]] = None
 
     retry_count_detection: int = 0
     retry_count_erase: int = 0
@@ -171,6 +183,13 @@ class JobState:
     # Pending brain plan produced from a user message (Route A).
     # Example: {intent: "correction", ...}
     pending_user_plan: Optional[Dict[str, Any]] = None
+    job_strategy_suggestions: Dict[str, Any] = field(default_factory=dict)
+    job_brain_summary: Optional[str] = None
+    job_brain_confidence: Optional[float] = None
+    job_brain_stage_last: Optional[str] = None
+    vlm_batch_size: int = 10
+    vlm_batches: List[Dict[str, Any]] = field(default_factory=list)
+    revision_batches: List[Dict[str, Any]] = field(default_factory=list)
 
     # page_index -> PageState
     pages: Dict[int, PageState] = field(default_factory=dict)

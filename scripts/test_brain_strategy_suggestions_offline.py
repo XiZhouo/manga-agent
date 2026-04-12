@@ -89,7 +89,9 @@ class StrategyTools(Tools):
     def __init__(self) -> None:
         super().__init__()
         self.last_revision_pages = None
+        self.last_apply_page_indices = None
         self.auto_revision_calls = 0
+        self.auto_revision_ranges = []
 
     def run_vlm_page(self, page, **kw):
         return {
@@ -117,7 +119,9 @@ class StrategyTools(Tools):
     def run_vlm_translation_revision(self, **kwargs):
         if kwargs.get("revision_mode") == "auto_rag_revision":
             self.auto_revision_calls += 1
+            self.auto_revision_ranges.append(kwargs.get("document_range"))
         self.last_revision_pages = len(kwargs["pages"])
+        self.last_apply_page_indices = kwargs.get("apply_page_indices")
         pages = kwargs["pages"]
         revised = []
         for p in pages:
@@ -191,7 +195,9 @@ def main() -> None:
         job = agent.run_until_waiting_or_done(job_id, max_steps=30)
         assert job.status.value == "completed"
         print("auto_revision_calls=", tools.auto_revision_calls)
-        assert tools.auto_revision_calls == 2
+        print("auto_revision_ranges=", tools.auto_revision_ranges)
+        assert tools.auto_revision_calls == 1
+        assert (tools.auto_revision_ranges[0] or {}).get("label") == "1-2"
 
         agent.handle_user_message(job_id, "第1页的 echo 应该统一一下")
         job = store.get_job(job_id)
@@ -202,7 +208,9 @@ def main() -> None:
         assert action.action_type.value == "run_revision", action
         job = agent.run_until_waiting_or_done(job_id, max_steps=20)
         print("revision_pages_used=", tools.last_revision_pages)
-        assert tools.last_revision_pages == 1
+        print("apply_page_indices=", tools.last_apply_page_indices)
+        assert tools.last_revision_pages == 3
+        assert tools.last_apply_page_indices == [0]
 
         agent.handle_user_message(job_id, "第1页整页重翻一下")
         job = store.get_job(job_id)

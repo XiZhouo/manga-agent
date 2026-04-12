@@ -28,7 +28,7 @@ class LamaServerConfig:
     """
 
     max_image_side: int = 0
-    runner: str = "auto"  # auto|simple_lama|saicinpainting_cli|opencv
+    runner: str = "auto"  # auto|simple_lama|saicinpainting_cli
     python_exe: str = "python"
     repo_dir: Optional[str] = None
     model_dir: Optional[str] = None
@@ -39,7 +39,7 @@ class LamaServerConfig:
 class InpaintRequest(BaseModel):
     image_b64: str = Field(..., description="Base64-encoded PNG/JPG bytes")
     mask_b64: str = Field(..., description="Base64-encoded PNG bytes; 0=keep, 255=remove")
-    backend: str = Field(default="lama", description="lama|opencv")
+    backend: str = Field(default="lama", description="lama")
     profile: str = Field(default="balanced", description="conservative|balanced|aggressive")
 
 
@@ -100,15 +100,6 @@ def _encode_png(img_bgr: np.ndarray) -> bytes:
     if not ok:
         raise HTTPException(status_code=500, detail="encode_failed")
     return bytes(buf)
-
-
-def _inpaint_opencv(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    import cv2
-
-    radius = float(os.getenv("LAMA_OPENCV_RADIUS", "3"))
-    method = (os.getenv("LAMA_OPENCV_METHOD", "telea") or "telea").lower().strip()
-    flags = cv2.INPAINT_TELEA if method == "telea" else cv2.INPAINT_NS
-    return cv2.inpaint(img_bgr, mask, radius, flags)
 
 
 @lru_cache(maxsize=1)
@@ -256,7 +247,7 @@ def _resolve_lama_runner(cfg: LamaServerConfig) -> str:
 
             return "simple_lama"
         except Exception:
-            return "opencv"
+            return "unavailable"
 
 
 def _inpaint_lama(img_bgr: np.ndarray, mask: np.ndarray, *, cfg: LamaServerConfig, profile: str) -> Tuple[np.ndarray, str]:
@@ -274,12 +265,10 @@ def _inpaint_lama(img_bgr: np.ndarray, mask: np.ndarray, *, cfg: LamaServerConfi
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"saicinpainting_cli_failed: {e}")
 
-    if runner == "opencv":
-        # Auto mode falls back to opencv so local development still works,
-        # but explicit lama runner misconfiguration should fail loudly.
+    if runner == "unavailable":
         if (cfg.runner or "auto").strip().lower() != "auto":
             raise HTTPException(status_code=500, detail="configured_lama_runner_unavailable")
-        return _inpaint_opencv(img_bgr, mask), "opencv:auto_fallback"
+        raise HTTPException(status_code=503, detail="lama_runner_unavailable")
 
     raise HTTPException(status_code=400, detail=f"unknown_lama_runner: {runner}")
 
@@ -293,9 +282,6 @@ def _inpaint_impl(
     cfg: LamaServerConfig,
 ) -> Tuple[np.ndarray, str]:
     backend2 = (backend or "lama").lower().strip()
-
-    if backend2 in {"opencv", "cv"}:
-        return _inpaint_opencv(img_bgr, mask), "opencv"
 
     if backend2 == "lama":
         return _inpaint_lama(img_bgr, mask, cfg=cfg, profile=profile)

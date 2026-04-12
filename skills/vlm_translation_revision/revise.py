@@ -108,6 +108,7 @@ def _extract_usage(resp: Any) -> Optional[Dict[str, Any]]:
 def _apply_patches_to_pages(
     *,
     pages: List[Dict[str, Any]],
+    document_range: Optional[Dict[str, Any]],
     patches: List[Dict[str, Any]],
     glossary_updates: List[Dict[str, Any]],
     warnings: List[str],
@@ -154,6 +155,7 @@ def _apply_patches_to_pages(
         "data": {
             "decision": decision,
             "ask_user": ask_user,
+            "document_range": document_range,
             "pages": revised_pages,
             "changed_pages": sorted(changed_pages),
             "patches": patches,
@@ -222,6 +224,7 @@ def _validate_patches(raw_patches: Any, max_patches: int) -> List[Dict[str, Any]
 def _run_auto_rag_revision(
     *,
     pages: List[Dict[str, Any]],
+    document_range: Optional[Dict[str, Any]],
     user_request: str,
     reading_direction: str,
     target_language: str,
@@ -232,6 +235,7 @@ def _run_auto_rag_revision(
     if not (os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")):
         return _apply_patches_to_pages(
             pages=pages,
+            document_range=document_range,
             patches=[],
             glossary_updates=[],
             warnings=["missing_api_key_auto_revision_skipped"],
@@ -247,6 +251,7 @@ def _run_auto_rag_revision(
     except Exception as e:
         return _apply_patches_to_pages(
             pages=pages,
+            document_range=document_range,
             patches=[],
             glossary_updates=[],
             warnings=[f"auto_revision_runtime_unavailable: {e}"],
@@ -277,6 +282,7 @@ def _run_auto_rag_revision(
 
     payload = {
         "task": "vlm_translation_auto_rag_revision",
+        "document_range": document_range,
         "user_request": user_request,
         "target_language": target_language,
         "reading_direction": reading_direction,
@@ -333,6 +339,7 @@ def _run_auto_rag_revision(
 
     return _apply_patches_to_pages(
         pages=pages,
+        document_range=document_range,
         patches=patches,
         glossary_updates=[x for x in glossary_updates if isinstance(x, dict)],
         warnings=warnings,
@@ -347,9 +354,11 @@ def _run_auto_rag_revision(
 def _run_user_feedback_revision(
     *,
     pages: List[Dict[str, Any]],
+    document_range: Optional[Dict[str, Any]],
     user_request: str,
     reference_page_number: Optional[int],
     scope: str,
+    apply_page_indices: Optional[List[int]],
     from_side: str,
     from_text: Optional[str],
     to_text: Optional[str],
@@ -406,6 +415,7 @@ def _run_user_feedback_revision(
             "data": {
                 "decision": "ask_user",
                 "ask_user": "请提供一个参照示例页码（例如：第12页），我才能对照判断并批量修正。",
+                "document_range": document_range,
                 "pages": pages,
                 "changed_pages": [],
                 "glossary_updates": [],
@@ -431,6 +441,7 @@ def _run_user_feedback_revision(
             "data": {
                 "decision": "ask_user",
                 "ask_user": "我理解你想纠正翻译，但缺少明确的‘原说法/错误译法’和‘期望译法’。请用‘X 应该翻译成 Y’的形式再发一次。",
+                "document_range": document_range,
                 "pages": pages,
                 "changed_pages": [],
                 "glossary_updates": [],
@@ -449,6 +460,7 @@ def _run_user_feedback_revision(
             "data": {
                 "decision": "ask_user",
                 "ask_user": "参照页不存在（可能页码超出范围）。请提供有效页码。",
+                "document_range": document_range,
                 "pages": pages,
                 "changed_pages": [],
                 "glossary_updates": [],
@@ -488,6 +500,8 @@ def _run_user_feedback_revision(
             "You receive one REFERENCE page (with full region list) and several CANDIDATE pages (full region lists). "
             "The user described a translation correction. "
             "Your job: decide which regions across candidate pages correspond to the same translation issue, and propose minimal patches that update tgt_text. "
+            "You may use pages outside the allowed patch set only as context. "
+            "You MUST propose patches only for allowed_patch_page_indices. "
             "You MUST NOT change region_id or bbox_xywh. Only change tgt_text. "
             "If uncertain, choose decision=ask_user and ask one short question. "
             "Return STRICT JSON only (no markdown)."
@@ -496,10 +510,12 @@ def _run_user_feedback_revision(
 
     payload = {
         "task": "vlm_translation_revision",
+        "document_range": document_range,
         "user_request": user_request,
         "reference_page_number": reference_page_number,
         "reference_page_index": ref_index,
         "scope": scope_norm,
+        "allowed_patch_page_indices": [int(x) for x in (apply_page_indices or []) if isinstance(x, int)],
         "from_side": from_side_norm,
         "from_text": from_text_norm,
         "to_text": to_text_norm,
@@ -560,6 +576,9 @@ def _run_user_feedback_revision(
         ask_user = None
 
     patches = _validate_patches(out.get("patches"), config.max_patches)
+    allowed_apply = {int(x) for x in (apply_page_indices or []) if isinstance(x, int)}
+    if allowed_apply:
+        patches = [x for x in patches if int(x.get("page_index")) in allowed_apply]
     glossary_updates = out.get("glossary_updates") or []
     if not isinstance(glossary_updates, list):
         glossary_updates = []
@@ -572,6 +591,7 @@ def _run_user_feedback_revision(
 
     return _apply_patches_to_pages(
         pages=pages,
+        document_range=document_range,
         patches=patches,
         glossary_updates=[x for x in glossary_updates if isinstance(x, dict)],
         warnings=warnings,
@@ -586,10 +606,12 @@ def _run_user_feedback_revision(
 def revise_vlm_translation(
     *,
     pages: List[Dict[str, Any]],
+    document_range: Optional[Dict[str, Any]] = None,
     revision_mode: str = "user_feedback_revision",
     user_request: str,
     reference_page_number: Optional[int],
     scope: str = "page_only",
+    apply_page_indices: Optional[List[int]] = None,
     from_side: str = "auto",
     from_text: Optional[str] = None,
     to_text: Optional[str] = None,
@@ -612,6 +634,7 @@ def revise_vlm_translation(
     if mode == "auto_rag_revision":
         return _run_auto_rag_revision(
             pages=pages,
+            document_range=document_range,
             user_request=user_request,
             reading_direction=reading_direction,
             target_language=target_language,
@@ -622,9 +645,11 @@ def revise_vlm_translation(
 
     return _run_user_feedback_revision(
         pages=pages,
+        document_range=document_range,
         user_request=user_request,
         reference_page_number=reference_page_number,
         scope=scope,
+        apply_page_indices=apply_page_indices,
         from_side=from_side,
         from_text=from_text,
         to_text=to_text,

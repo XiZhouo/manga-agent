@@ -11,8 +11,10 @@ from skills.vlm_translation_revision.revise import VLMTranslationRevisionConfig,
 def vlm_translation_revision(
     pages: List[Dict[str, Any]],
     user_request: str,
+    document_range: Optional[Dict[str, Any]] = None,
     reference_page_number: Optional[int] = None,
     scope: str = "page_only",
+    apply_page_indices: Optional[List[int]] = None,
     from_side: str = "auto",
     from_text: Optional[str] = None,
     to_text: Optional[str] = None,
@@ -41,9 +43,11 @@ def vlm_translation_revision(
 
     return revise_vlm_translation(
         pages=pages,
+        document_range=document_range,
         user_request=user_request,
         reference_page_number=reference_page_number,
         scope=scope,
+        apply_page_indices=apply_page_indices,
         from_side=from_side,
         from_text=from_text,
         to_text=to_text,

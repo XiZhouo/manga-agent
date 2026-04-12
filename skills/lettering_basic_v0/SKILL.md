@@ -17,11 +17,20 @@ This skill should never erase source text itself. Erasing is handled by the dedi
 Required fields:
 
 - `image_bytes`: erased page image bytes
+- `page_index`: current page index
 - `regions`: list of translated regions
   - `region_id`
   - `bbox_xywh`
   - `has_text_box`
+  - `color`
   - `translated_text`
+
+Recommended metadata fields:
+
+- `page_range`
+  - original document/window range that produced the translation text
+- `batch_id`
+  - optional upstream batch trace id
 
 ---
 
@@ -59,6 +68,12 @@ For art-integrated text (`has_text_box=false`), the skill uses a different defau
 - larger font ceiling
 - white fill with black outline to preserve over-art readability
 
+Color guidance:
+
+- if `color` is present, lettering should prefer that fill color instead of the mode default
+- if `color` is missing, fall back to the existing mode default
+- the outline/stroke should be chosen for contrast automatically
+
 ---
 
 ## Output
@@ -72,6 +87,8 @@ For art-integrated text (`has_text_box=false`), the skill uses a different defau
 The orchestrator should persist the rendered page separately from the erased page, typically:
 
 - `data/jobs/<job_id>/rendered/page_XXXX.png`
+
+Even when the source translation arrived from a 10-page VLM window, lettering still runs per page and should keep page-local output files.
 
 ---
 

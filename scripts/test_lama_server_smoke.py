@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from skills.lama_erase_server.server import InpaintRequest, inpaint
+from skills.lama_erase_server import server
 
 
 def _png_b64(img: Image.Image) -> str:
@@ -34,14 +34,17 @@ def _build_demo() -> tuple[str, str]:
 
 def main() -> None:
     image_b64, mask_b64 = _build_demo()
-    req = InpaintRequest(
+    server._resolve_lama_runner = lambda cfg: "simple_lama"  # type: ignore[assignment]
+    server._inpaint_simple_lama = lambda img_bgr, mask: img_bgr  # type: ignore[assignment]
+
+    req = server.InpaintRequest(
         image_b64=image_b64,
         mask_b64=mask_b64,
-        backend="opencv",
+        backend="lama",
         profile="balanced",
     )
-    resp = inpaint(req)
-    assert resp.backend == "opencv"
+    resp = server.inpaint(req)
+    assert resp.backend == "lama:simple_lama"
 
     out = Image.open(io.BytesIO(base64.b64decode(resp.image_b64))).convert("RGB")
     arr = np.array(out)
