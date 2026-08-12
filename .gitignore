@@ -1,7 +1,10 @@
 data/
 models/
+mangatest/
 __pycache__/
+.pytest_cache/
 *.pyc
+skill_outputs/
 .env
 .venv/
 .vscode/

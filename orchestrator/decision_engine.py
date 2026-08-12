@@ -712,9 +712,11 @@ class DecisionEngine:
                         page.vlm_downscaled is True
                         or (page.vlm_quality_reason in {"vlm_request_failed", "bad_json"})
                         or (page.vlm_quality_reason or "").startswith("vlm_zero_regions")
+                        or (page.vlm_quality_reason or "") == "zero_regions_but_detector_found_text"
                         or (page.vlm_quality_reason or "").startswith("too_many_empty")
                         or (page.vlm_quality_reason == "target_language_mismatch")
                         or (page.vlm_quality_reason == "suspicious_bbox_geometry")
+                        or (page.vlm_quality_reason or "") in {"bbox_too_large_for_text", "bbox_looks_loose", "overlapping_oversized_bboxes"}
                         or (page.vlm_quality_reason or "") in {"judge_retry"}
                     )
                     if can_retry:
@@ -775,6 +777,8 @@ class DecisionEngine:
             )
 
         if page.stage == PageStage.ERASED:
+            erase_qa = page.qa_reports.get("erase") if isinstance(page.qa_reports, dict) else {}
+            erase_qa_status = str((erase_qa or {}).get("status") or "").strip().lower()
             proactive = self._guard_brain_page_action(
                 job,
                 page,
@@ -782,6 +786,14 @@ class DecisionEngine:
             )
             if proactive is not None:
                 return proactive
+
+            if erase_qa_status in {"retryable", "bad"} and page.retry_count_erase < self.MAX_RETRY_ERASE:
+                return AgentAction(
+                    action_type=ActionType.RETRY_ERASE,
+                    page_index=page.page_index,
+                    payload=self._skill_payload(page, "lama_eraser"),
+                    reason=f"Erase QA marked this page as {erase_qa_status}; retry erase before typesetting.",
+                )
 
             return AgentAction(
                 action_type=ActionType.RUN_TYPESET,
@@ -795,7 +807,11 @@ class DecisionEngine:
                 region for region in page.regions.values()
                 if (not region.render_ok) or region.render_overflow
             ]
-            if bad_render_regions:
+            typeset_qa = (page.typeset_metrics or {}).get("qa") if isinstance(page.typeset_metrics, dict) else {}
+            typeset_qa_status = str((typeset_qa or {}).get("status") or "").strip().lower()
+            erase_qa = page.qa_reports.get("erase") if isinstance(page.qa_reports, dict) else {}
+            erase_qa_status = str((erase_qa or {}).get("status") or "").strip().lower()
+            if bad_render_regions or typeset_qa_status in {"retryable", "bad"}:
                 proactive = self._guard_brain_page_action(
                     job,
                     page,
@@ -811,6 +827,14 @@ class DecisionEngine:
                 if proactive is not None:
                     return proactive
 
+                if erase_qa_status in {"retryable", "bad"} and page.retry_count_erase < self.MAX_RETRY_ERASE:
+                    return AgentAction(
+                        action_type=ActionType.RETRY_ERASE,
+                        page_index=page.page_index,
+                        payload=self._skill_payload(page, "lama_eraser"),
+                        reason="Typesetting issue likely rooted in erase QA; retry erase first.",
+                    )
+
                 page_strategy = self._strategy_for_page(page)
                 preferred_rerun = str(page_strategy.get("preferred_rerun_action") or "").strip().lower()
                 if preferred_rerun == "retry_erase" and page.retry_count_erase < self.MAX_RETRY_ERASE:
@@ -822,14 +846,14 @@ class DecisionEngine:
                     )
                 can_retry = all(
                     region.retry_count_render < self.MAX_RETRY_RENDER
-                    for region in bad_render_regions
+                    for region in (bad_render_regions or list(page.regions.values()))
                 )
                 if can_retry:
                     return AgentAction(
                         action_type=ActionType.RETRY_TYPESET,
                         page_index=page.page_index,
                         payload=self._skill_payload(page, "lettering"),
-                        reason="Typesetting overflow/bad render; retry typeset.",
+                        reason="Typesetting QA/layout issue detected; retry typeset.",
                     )
                 return AgentAction(
                     action_type=ActionType.ASK_USER,
@@ -869,6 +893,21 @@ class DecisionEngine:
         if page.stage in [PageStage.DONE, PageStage.FAILED]:
             pipeline_mode = str(job.user_preferences.get("pipeline_mode") or "classic").lower()
             if pipeline_mode == "vlm" and page.stage == PageStage.FAILED:
+                page_error_stage = str(getattr(page, "page_error_stage", "") or "").strip().lower()
+                page_error_code = str(getattr(page, "page_error_code", "") or "").strip().lower()
+                erase_metrics = getattr(page, "erase_metrics", None) or {}
+                service_error = erase_metrics.get("service_error") if isinstance(erase_metrics, dict) else None
+                if page_error_stage == "erase" and (
+                    isinstance(service_error, dict)
+                    or "service_unreachable" in page_error_code
+                    or "service_unavailable" in page_error_code
+                    or "timeout" in page_error_code
+                ):
+                    return AgentAction(
+                        action_type=ActionType.ASK_USER,
+                        page_index=page.page_index,
+                        reason="Windows 远程擦除服务当前无响应，请先重启该服务，再重试本页擦除。",
+                    )
                 # Allow retrying VLM core if the failure came from the VLM step.
                 if (
                     page.page_error_message

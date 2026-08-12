@@ -274,7 +274,7 @@ def _run_auto_rag_revision(
             "You receive current page translations plus a retrieval_context that contains glossary hits, translation memory hits, style hints, and project rules. "
             "Your job is to apply a minimal consistency pass. Only patch tgt_text when retrieval_context gives strong evidence. "
             "Prioritize locked glossary and locked translation memory entries over everything else. "
-            "Do not rewrite the whole page. Do not change region_id, bbox_xywh, src_text, or ordering. "
+            "Do not rewrite the whole page. Do not change region_id, bbox_xyxy, src_text, or ordering. "
             "If nothing clearly needs fixing, return an empty patches list. "
             "Return STRICT JSON only (no markdown)."
         )
@@ -502,7 +502,7 @@ def _run_user_feedback_revision(
             "Your job: decide which regions across candidate pages correspond to the same translation issue, and propose minimal patches that update tgt_text. "
             "You may use pages outside the allowed patch set only as context. "
             "You MUST propose patches only for allowed_patch_page_indices. "
-            "You MUST NOT change region_id or bbox_xywh. Only change tgt_text. "
+            "You MUST NOT change region_id or bbox_xyxy. Only change tgt_text. "
             "If uncertain, choose decision=ask_user and ask one short question. "
             "Return STRICT JSON only (no markdown)."
         )

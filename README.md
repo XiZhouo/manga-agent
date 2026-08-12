@@ -16,7 +16,7 @@ pip install -r requirements.txt
 
 - `pdf2image` requires Poppler (`pdftoppm`).
 - `rarfile` may require `unrar` for `.rar/.cbr`.
-- For Windows GPU deployment of the LaMa HTTP service, see `docs/windows_lama_deployment.md`.
+- For the current Windows-side inpaint service contract, see `docs/windows_manga_cleaner_service_spec.md`.
 
 ## Design Spec (working notes)
 
@@ -77,7 +77,7 @@ Switching policy:
 Token/quality knob (VLM):
 
 - `MANGA_AGENT_VLM_BATCH_SIZE` (default: `10`, max recommended: `10`). The job-level brain opens one contiguous VLM page window at a time.
-- `MANGA_AGENT_VLM_MAX_HEIGHT` (default: `3057`). If the image height is larger, it will be downscaled for the VLM call, and returned bboxes are mapped back to original pixel coordinates.
+- `MANGA_AGENT_VLM_MAX_HEIGHT` (default: `0`). V1 defaults to full-resolution upload; set a positive value only if you explicitly want to downscale before the VLM call.
 - `MANGA_AGENT_VLM_MAX_WIDTH` (default: `0`, meaning no cap). If set (e.g. `3057`), width larger than this will be downscaled too (cheaper but may affect double-page spreads).
 - `MANGA_AGENT_VLM_MAX_LONG_SIDE` (default: `0`, optional extra safety cap).
 
@@ -204,16 +204,45 @@ Backward-compatible flat keys are still preserved for older tooling:
 
 ### LaMa mask chain (current)
 
-The erase path is now explicitly split into `region metadata -> mask refinement -> LaMa`.
+The erase path is now explicitly split into:
 
-For each region:
+```text
+region metadata -> remote text detect -> client-side mask refinement -> LaMa
+```
 
-1. VLM supplies `bbox_xywh` plus `has_text_box`.
-2. The client expands the ROI a little before mask extraction.
-3. `refine_mask()` picks a threshold candidate and removes obviously bad components.
-4. `complete_mask()` closes gaps / fills holes, especially for `has_text_box=false` art-integrated text.
-5. Region masks are merged into one page mask and persisted as debug artifacts.
+Current default is `mask_source_mode = manga_auto_hybrid`.
+
+Detailed flow:
+
+1. VLM supplies per-region metadata:
+   - `bbox_xyxy`
+   - `has_text_box`
+   - translated text and style hints
+2. The Windows service runs `manga-cleaner`-style text detection and returns:
+   - a raw detect mask
+   - a heatmap/debug mask
+3. The client builds a **hybrid mask**:
+   - use the heatmap as the tight seed
+   - use the raw detect mask as the growth envelope
+   - use VLM bbox only to assign/filter components per region
+   - do **not** rasterize bbox rectangles into the final mask silhouette
+4. The seed is dilated inside the envelope until it covers text strokes well enough without jumping to the full raw blob.
+5. The final page mask plus overlay/debug artifacts are persisted locally.
 6. LaMa receives only `image + final mask + profile`.
+
+Current tuned default for `page002` / DC speech-bubble pages:
+
+- `mask_source_mode = manga_auto_hybrid`
+- `hybrid_seed_safe_expand_px = 5`
+- `hybrid_envelope_safe_expand_px = 40`
+- `hybrid_growth_iterations = 15`
+- `hybrid_growth_kernel_px = 3`
+- tuning comment: `DC-Nightwing`
+
+Fallback behavior:
+
+- if the remote detector returns no usable heatmap, the pipeline falls back to `manga_auto_constrained`
+- if remote detect is unavailable, the old local heuristic mask path still exists as a last resort
 
 Important consequence: improving erase quality for cases like `test3` is primarily a mask problem first, not an inpainting-model switch first.
 

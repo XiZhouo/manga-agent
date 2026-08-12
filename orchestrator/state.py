@@ -69,6 +69,7 @@ class RegionState:
     """
     region_id: int
     bbox: Optional[List[int]] = None  # [x, y, w, h]
+    bbox_xyxy: Optional[List[int]] = None  # [x1, y1, x2, y2] in original image pixels
     region_type: str = "text"
     has_text_box: Optional[bool] = None
     color: str = "black"
@@ -78,6 +79,8 @@ class RegionState:
 
     translated_text: Optional[str] = None
     translation_confidence: Optional[float] = None
+    placement_lines: Optional[List[Dict[str, Any]]] = None
+    placement_source: Optional[str] = None
 
     render_ok: bool = False
     render_overflow: bool = False
@@ -150,10 +153,14 @@ class PageState:
     erase_metrics: Optional[Dict[str, Any]] = None
     lettering_ok: bool = False
     typeset_metrics: Optional[Dict[str, Any]] = None
+    qa_reports: Dict[str, Any] = field(default_factory=dict)
 
     retry_count_detection: int = 0
     retry_count_erase: int = 0
     page_error_message: Optional[str] = None
+    page_error_stage: Optional[str] = None
+    page_error_code: Optional[str] = None
+    page_error_details: Optional[Dict[str, Any]] = None
 
     # 用户是否手动要求重跑这一页
     needs_manual_rerun: bool = False

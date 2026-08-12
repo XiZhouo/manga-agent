@@ -10,23 +10,78 @@ Typical flow:
 
 1. Orchestrator provides the original page image.
 2. The page may originate from a VLM document window such as `page_range=10-19`.
-2. A text mask is built from VLM/detection regions.
-3. The HTTP eraser service receives `image + mask + profile`.
-4. The service returns an erased page image.
-5. The erased image is cached and reused for re-typesetting after translation edits.
-6. Pages with art-integrated text (`has_text_box=false`) should use the embedded-text mask path before calling LaMa.
+3. The Windows service first provides remote text-detect artifacts.
+4. The client builds a text mask from VLM regions plus remote detect outputs.
+5. The HTTP eraser service receives `image + mask + profile`.
+6. The service returns an erased page image.
+7. The erased image is cached and reused for re-typesetting after translation edits.
+8. Pages with art-integrated text (`has_text_box=false`) should still use the embedded-text path, but the current mainline is the hybrid remote-detect mask.
 
 ### Client-side mask pipeline
 
-The current mask chain is intentionally heuristic-only; it does not require any extra segmentation model:
+Current default mask chain:
 
-1. Start from each VLM region bbox.
-2. Expand the ROI slightly (`box_expand_px` / `embedded_box_expand_px`).
-3. Run `refine_mask()` to select a threshold candidate and remove bad components.
-4. Run `complete_mask()` to close gaps / fill holes, especially for embedded text.
-5. Merge all region masks into the page mask and send that mask to LaMa.
+1. Call remote `POST /detect-text-mask` with the source page.
+2. Receive:
+   - `mask_b64`: raw manga-cleaner detect mask
+   - `debug_artifacts.heatmap_b64`: tight text heatmap when available
+3. Use VLM regions only to assign/filter connected components per text region.
+4. Build a **hybrid mask**:
+   - heatmap -> seed
+   - raw detect mask -> growth envelope
+   - grow the seed inside the envelope with a small kernel
+5. Persist debug artifacts:
+   - raw detect mask
+   - final refined mask
+   - overlay
+6. Call `POST /inpaint` with the final mask.
 
-This is the place where we borrow the main idea from `manga-image-translator`'s `refine_mask()` / `complete_mask()` family: improve the mask before inpainting instead of hoping LaMa can fix a poor mask.
+Current default strategy:
+
+- `mask_source_mode = manga_auto_hybrid`
+- comment: `DC-Nightwing`
+- tuned params:
+  - `hybrid_seed_safe_expand_px = 5`
+  - `hybrid_envelope_safe_expand_px = 40`
+  - `hybrid_growth_iterations = 15`
+  - `hybrid_growth_kernel_px = 3`
+
+Important constraint:
+
+- VLM bbox should constrain **which components belong to which region**
+- VLM bbox should **not** be rasterized as rectangle mask geometry in the final output
+
+This keeps the mask close to real glyph shapes and avoids box-like damage to speech-bubble edges.
+
+The older local heuristic path still exists, but it is now a fallback rather than the preferred route.
+
+### Historical / optional refinement paths
+
+Earlier experiments included heuristic ROI refinement and optional SAM-based refinement. They are kept for fallback/debug, but they are not the preferred default now.
+
+Those paths are still relevant when the current hybrid pipeline:
+
+- clips some glyph strokes
+- leaves residue inside the text block
+- swallows bubble borders / caption edges
+
+the client can switch `mask_refine_mode` from `heuristic` to `sam_auto` or `sam_required`.
+
+The remote service then follows an `Inpaint-Anything`-style idea:
+
+1. Use the existing heuristic mask as a coarse seed.
+2. Convert each text region into SAM prompts:
+   - positive points sampled from mask components
+   - negative points near the bbox border to protect bubble edges
+   - the region bbox as a box prompt
+3. Ask SAM for multiple candidate masks.
+4. Score the candidates by:
+   - coarse-mask recall
+   - overlap with a protected edge ring
+   - bbox-area ratio
+5. Merge the best per-region masks into a refined page mask.
+
+This gives us a practical path toward “erase all text but preserve bubble edges” without trusting raw bbox rectangles.
 
 ---
 
@@ -57,10 +112,48 @@ Optional fields:
   - `balanced`: default choice for normal speech/caption text
   - `aggressive`: stronger cleanup for embedded title text / art-integrated text / large serif text
 
+- `mask_source`
+  - recommended value from the client metadata:
+    - `manga_auto_hybrid`
+    - `manga_auto_constrained`
+    - `manga_auto_raw`
+    - `heuristic`
+
 The client is responsible for deriving the mask from per-region metadata, including:
 
-- `bbox_xywh`
+- `bbox_xyxy` or `bbox_xywh`
 - `has_text_box`
+
+### HTTP `POST /refine-mask`
+
+Optional preprocessing endpoint before `/inpaint`.
+
+Required fields:
+
+- `image_b64`
+- `coarse_mask_b64`
+- `regions`
+
+Per-region fields:
+
+- `region_id`
+- `bbox_xywh` or `bbox_xyxy`
+- `has_text_box`
+
+Optional tuning fields:
+
+- `positive_points_per_region`
+- `negative_points_per_region`
+- `edge_protect_px`
+- `mask_dilate_px`
+- `multimask_output`
+
+Expected response:
+
+- `refined_mask_b64`
+- `overlay_b64`
+- `backend` such as `sam:vit_h`
+- `metrics.region_metrics[]`
 
 ---
 
@@ -69,6 +162,12 @@ The client is responsible for deriving the mask from per-region metadata, includ
 The Brain should not invent arbitrary eraser arguments. It should only choose from supported knobs.
 
 ### Main decision knobs
+
+- `mask_source_mode`
+  - `manga_auto_hybrid`: current default
+  - `manga_auto_constrained`: use constrained raw detect mask without the hybrid growth stage
+  - `manga_auto`: use raw detect output directly
+  - `heuristic`: old local threshold-based mask path
 
 - `profile`
   - choose `balanced` by default
@@ -81,22 +180,63 @@ The Brain should not invent arbitrary eraser arguments. It should only choose fr
     - first erase damages nearby line art or shading
 
 - `mask_dilate_px`
-  - this is generated on the client side before the HTTP call
+  - only relevant for the heuristic fallback path
   - larger values remove more edge pixels but increase damage risk
-  - suggested policy:
-    - `2` default
-    - `3-4` for thick title text
-    - `1` for delicate line art
 
 - `embedded_box_expand_px`
-  - expands the ROI around `has_text_box=false` regions before mask extraction
+  - mainly for the heuristic fallback path around `has_text_box=false` regions
   - increase it when the bbox is tight and edge strokes are being missed
   - decrease it when nearby artwork is being swallowed into the mask
 
 - `embedded_complete_mask_close_px`
+  - mainly for the heuristic fallback path
   - controls how aggressively the embedded-text path bridges broken glyph strokes
   - increase it when integrated text is fragmented into many small mask islands
   - decrease it when unrelated art details get connected into the same mask
+
+- `hybrid_seed_safe_expand_px`
+  - how much the seed assignment may expand around each VLM bbox
+  - smaller values keep the seed tighter to visible glyphs
+  - larger values help rescue thin edge strokes
+
+- `hybrid_envelope_safe_expand_px`
+  - how far the raw detect envelope may extend around each VLM bbox
+  - larger values allow more mask growth but raise the risk of swallowing bubble edges
+
+- `hybrid_growth_iterations`
+  - how many growth steps the seed may take inside the envelope
+  - this is the main aggressiveness knob for residue cleanup
+
+- `hybrid_growth_kernel_px`
+  - per-step growth kernel size
+  - current tuned default is `3`
+  - increasing it is stronger than simply adding a few iterations
+
+- `mask_refine_mode`
+  - historical fallback switch, not the current mainline
+  - `heuristic`: stay on the old local coarse-mask path
+  - `sam_auto`: try remote SAM refinement and fall back to heuristic mask if unavailable
+  - `sam_required`: require remote SAM refinement; fail fast if the service/checkpoint is unavailable
+
+- `sam_positive_points_per_region`
+  - more points help recover fragmented glyphs
+  - start with `4`
+  - increase for dense serif text or multi-line narration blocks
+
+- `sam_negative_points_per_region`
+  - more negative points strengthen bubble-edge protection
+  - start with `8`
+  - increase when the refined mask keeps swallowing speech-balloon borders
+
+- `sam_edge_protect_px`
+  - width of the edge-protection ring used both in prompting and candidate scoring
+  - increase when bubble borders are still being damaged
+  - decrease when text lies very close to the bbox boundary and gets under-masked
+
+- `sam_mask_dilate_px`
+  - optional small dilation after SAM selection
+  - use `0-1` for normal dialogue
+  - only push higher when thin glyph edges are repeatedly missed
 
 - `has_text_box`
   - `true`: standard bubble/caption cleanup path
@@ -117,6 +257,7 @@ The Brain should not invent arbitrary eraser arguments. It should only choose fr
 
 Typical `backend` values returned by the server:
 
+- `lama:manga_cleaner_onnx`
 - `lama:simple_lama`
 - `lama:saicinpainting_cli`
 
@@ -190,11 +331,45 @@ If neither runner is available, the service should fail loudly so the orchestrat
     "retry with a different profile when residue or art damage is observed"
   ],
   "params": {
+    "mask_source_mode": {
+      "type": "enum",
+      "values": ["manga_auto_hybrid", "manga_auto_constrained", "manga_auto", "heuristic"],
+      "default": "manga_auto_hybrid",
+      "effect": "chooses whether erase uses the hybrid remote-detect mask, a simpler constrained/raw detect mask, or the old local heuristic path"
+    },
     "profile": {
       "type": "enum",
       "values": ["conservative", "balanced", "aggressive"],
       "default": "balanced",
       "effect": "controls inpainting strength and texture preservation"
+    },
+    "hybrid_seed_safe_expand_px": {
+      "type": "int",
+      "min": 0,
+      "max": 32,
+      "default": 5,
+      "effect": "controls how tightly the hybrid seed stays around text components before growth"
+    },
+    "hybrid_envelope_safe_expand_px": {
+      "type": "int",
+      "min": 0,
+      "max": 128,
+      "default": 40,
+      "effect": "controls how far the raw detect envelope may extend around assigned components"
+    },
+    "hybrid_growth_iterations": {
+      "type": "int",
+      "min": 0,
+      "max": 64,
+      "default": 15,
+      "effect": "main aggressiveness knob for growing the heatmap seed inside the raw detect envelope"
+    },
+    "hybrid_growth_kernel_px": {
+      "type": "int",
+      "min": 1,
+      "max": 9,
+      "default": 3,
+      "effect": "per-step growth kernel size; stronger than adding a small number of extra iterations"
     },
     "mask_dilate_px": {
       "type": "int",
@@ -202,6 +377,40 @@ If neither runner is available, the service should fail loudly so the orchestrat
       "max": 5,
       "default": 2,
       "effect": "larger values erase more edge pixels but increase art damage risk"
+    },
+    "mask_refine_mode": {
+      "type": "enum",
+      "values": ["heuristic", "sam_auto", "sam_required"],
+      "default": "heuristic",
+      "effect": "legacy fallback switch for the optional SAM path; the normal default flow is manga_auto_hybrid without SAM"
+    },
+    "sam_positive_points_per_region": {
+      "type": "int",
+      "min": 1,
+      "max": 12,
+      "default": 4,
+      "effect": "number of positive seed points sampled from the coarse text mask"
+    },
+    "sam_negative_points_per_region": {
+      "type": "int",
+      "min": 0,
+      "max": 16,
+      "default": 8,
+      "effect": "number of negative protection points near the bbox edge"
+    },
+    "sam_edge_protect_px": {
+      "type": "int",
+      "min": 1,
+      "max": 64,
+      "default": 10,
+      "effect": "width of the edge ring used to discourage masks from touching bubble borders"
+    },
+    "sam_mask_dilate_px": {
+      "type": "int",
+      "min": 0,
+      "max": 8,
+      "default": 0,
+      "effect": "optional final dilation after SAM candidate selection to recover thin glyph fragments"
     },
     "mask_min_coverage": {
       "type": "float",

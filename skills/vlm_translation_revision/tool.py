@@ -30,7 +30,7 @@ def vlm_translation_revision(
 
     Notes:
     - Does NOT call VLM; uses a text LLM to plan patches.
-    - Input/output page schema matches VLM-style {page_index, regions[{region_id,bbox_xywh,src_text,tgt_text}]}.
+    - Input/output page schema matches VLM-style {page_index, regions[{region_id,bbox_xyxy,src_text,tgt_text}]}.
     - Reads API key from env: `DASHSCOPE_API_KEY` (preferred) or `OPENAI_API_KEY` (fallback).
     """
 

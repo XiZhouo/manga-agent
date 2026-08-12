@@ -41,6 +41,7 @@ def main() -> None:
     parser.add_argument("--image", type=str, required=True, help="Input page image path.")
     parser.add_argument("--mask", type=str, required=True, help="Input mask image path (white=erase).")
     parser.add_argument("--output-dir", type=str, required=True, help="Output directory.")
+    parser.add_argument("--url", type=str, default="", help="Optional service base URL override.")
     parser.add_argument("--profile", type=str, default="balanced", help="Remote inpaint profile.")
     parser.add_argument("--timeout-sec", type=int, default=180, help="HTTP timeout seconds.")
     args = parser.parse_args()
@@ -60,7 +61,7 @@ def main() -> None:
     (output_dir / "input_image.png").write_bytes(image_bytes)
     (output_dir / "input_mask.png").write_bytes(mask_bytes)
 
-    url = _load_runtime_url()
+    url = (args.url or "").strip() or _load_runtime_url()
     payload = {
         "image_b64": _b64(image_bytes),
         "mask_b64": _b64(mask_bytes),
@@ -75,6 +76,11 @@ def main() -> None:
         "mask": str(mask_path),
         "profile": args.profile,
         "timeout_sec": args.timeout_sec,
+        "params": {
+            "profile": args.profile,
+            "timeout_sec": args.timeout_sec,
+            "url": url,
+        },
         "started_at_epoch": started_at,
     }
 

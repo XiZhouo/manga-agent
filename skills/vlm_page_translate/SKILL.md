@@ -55,10 +55,12 @@ The images are sent in the same order as `pages`.
     {
       "page_index": 0,
       "page_type": "content",
+      "original_image_size": {"width": 1988, "height": 3057},
+      "sent_image_size": {"width": 1988, "height": 3057},
       "regions": [
         {
           "region_id": 1,
-          "bbox_xywh": [10, 20, 100, 40],
+          "bbox_xyxy": [10, 20, 110, 60],
           "has_text_box": true,
           "color": "black",
           "src_text": "Hello",
@@ -75,8 +77,11 @@ Notes:
 
 - `page_range` is the document/window envelope and should be preserved downstream
 - every page should include `page_type` = `cover|info|content`
+- every page should include `original_image_size` and `sent_image_size`
 - `cover` and `info` pages should return an empty `regions` list and skip OCR/translation
 - each page keeps its own region ids; region ids only need to be stable within that page
+- `bbox_xyxy` is the canonical final bbox format and must be in original-image pixel coordinates
+- V1 default is to send the original image without downscaling, so `sent_image_size` usually equals `original_image_size`
 - `has_text_box=false` is important for later erase + lettering decisions
 - `color` is the preferred text fill color for later lettering; default to `black` if uncertain
 

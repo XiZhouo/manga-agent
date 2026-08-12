@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
+from .job_io import page_skill_dir, resolve_job_dir_from_path, write_json
 from .state import PageState
 
 
@@ -16,6 +17,38 @@ def _page_range(page_indices: List[int]) -> Dict[str, Any]:
         "page_indices": ordered,
         "label": f"{ordered[0]}-{ordered[-1]}",
     }
+
+
+def _normalize_tool_error(raw_error: Any, *, default_code: str, default_message: str) -> Dict[str, Any]:
+    if isinstance(raw_error, dict):
+        out = dict(raw_error)
+        out.setdefault("code", default_code)
+        out.setdefault("message", default_message)
+        return out
+    message = str(raw_error or default_message)
+    return {"code": default_code, "message": message}
+
+
+def _build_remote_service_metrics(error: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "failure_kind": "remote_service",
+        "failure_stage": "erase_remote_call",
+        "service_error": dict(error),
+        "erase_backend": "remote_http",
+    }
+
+
+def _resolve_page_job_dir(page: PageState) -> Optional[Path]:
+    image_ref = str(getattr(page, "image_ref", "") or "").strip()
+    if image_ref:
+        return resolve_job_dir_from_path(Path(image_ref))
+    erased_ref = str(getattr(page, "erased_image_ref", "") or "").strip()
+    if erased_ref:
+        return resolve_job_dir_from_path(Path(erased_ref))
+    rendered_ref = str(getattr(page, "rendered_image_ref", "") or "").strip()
+    if rendered_ref:
+        return resolve_job_dir_from_path(Path(rendered_ref))
+    return None
 
 
 class Tools:
@@ -164,7 +197,7 @@ class Tools:
             temperature = float(os.getenv("MANGA_AGENT_VLM_TEMPERATURE", "0.0"))
             timeout_raw = (os.getenv("MANGA_AGENT_VLM_TIMEOUT_SECONDS", "") or "").strip()
             timeout_seconds = float(timeout_raw) if timeout_raw else None
-            enable_thinking = (os.getenv("MANGA_AGENT_VLM_ENABLE_THINKING", "false") or "false").strip().lower() in {
+            enable_thinking = (os.getenv("MANGA_AGENT_VLM_ENABLE_THINKING", "true") or "true").strip().lower() in {
                 "1",
                 "true",
                 "yes",
@@ -175,12 +208,8 @@ class Tools:
                 (os.getenv("MANGA_AGENT_VLM_HIGH_RESOLUTION_IMAGES", "true") or "true").strip().lower()
                 in {"1", "true", "yes", "on"}
             )
-            # Resize policy defaults (aligned with common US-comic page scans):
-            # - cap height to 3057
-            # - do not cap width (keeps double-page spreads)
             max_width = int(os.getenv("MANGA_AGENT_VLM_MAX_WIDTH", "0"))
-            max_height = int(os.getenv("MANGA_AGENT_VLM_MAX_HEIGHT", "3057"))
-            # Optional extra safety cap
+            max_height = int(os.getenv("MANGA_AGENT_VLM_MAX_HEIGHT", "0"))
             max_long_side = int(os.getenv("MANGA_AGENT_VLM_MAX_LONG_SIDE", "0"))
 
             if force_fullres:
@@ -259,7 +288,7 @@ class Tools:
                 regions_out.append(
                     {
                         "region_id": int(r.get("region_id")),
-                        "bbox": r.get("bbox_xywh"),
+                        "bbox_xyxy": r.get("bbox_xyxy"),
                         "region_type": "text",
                         "has_text_box": r.get("has_text_box"),
                         "color": r.get("color", "black"),
@@ -272,6 +301,9 @@ class Tools:
             return {
                 "ok": True,
                 "page_type": data.get("page_type", "content"),
+                "original_image_size": data.get("original_image_size") or data.get("image_size"),
+                "sent_image_size": data.get("sent_image_size") or data.get("image_size_sent"),
+                "coordinate_space": data.get("coordinate_space") or "original_image_pixels",
                 "regions": regions_out,
                 "bbox_error": False,
                 "raw": raw,
@@ -324,7 +356,7 @@ class Tools:
             temperature = float(os.getenv("MANGA_AGENT_VLM_TEMPERATURE", "0.0"))
             timeout_raw = (os.getenv("MANGA_AGENT_VLM_TIMEOUT_SECONDS", "") or "").strip()
             timeout_seconds = float(timeout_raw) if timeout_raw else None
-            enable_thinking = (os.getenv("MANGA_AGENT_VLM_ENABLE_THINKING", "false") or "false").strip().lower() in {
+            enable_thinking = (os.getenv("MANGA_AGENT_VLM_ENABLE_THINKING", "true") or "true").strip().lower() in {
                 "1",
                 "true",
                 "yes",
@@ -336,7 +368,7 @@ class Tools:
                 in {"1", "true", "yes", "on"}
             )
             max_width = int(os.getenv("MANGA_AGENT_VLM_MAX_WIDTH", "0"))
-            max_height = int(os.getenv("MANGA_AGENT_VLM_MAX_HEIGHT", "3057"))
+            max_height = int(os.getenv("MANGA_AGENT_VLM_MAX_HEIGHT", "0"))
             max_long_side = int(os.getenv("MANGA_AGENT_VLM_MAX_LONG_SIDE", "0"))
             cfg = VLMPageTranslateConfig(
                 model=model,
@@ -401,7 +433,7 @@ class Tools:
                     regions_out.append(
                         {
                             "region_id": int(r.get("region_id")),
-                            "bbox": r.get("bbox_xywh"),
+                            "bbox_xyxy": r.get("bbox_xyxy"),
                             "region_type": "text",
                             "has_text_box": r.get("has_text_box"),
                             "color": r.get("color", "black"),
@@ -414,6 +446,9 @@ class Tools:
                     {
                         "page_index": page_index,
                         "page_type": item.get("page_type", "content"),
+                        "original_image_size": item.get("original_image_size") or item.get("image_size"),
+                        "sent_image_size": item.get("sent_image_size") or item.get("image_size_sent"),
+                        "coordinate_space": item.get("coordinate_space") or "original_image_pixels",
                         "regions": regions_out,
                         "bbox_error": False,
                         "vlm_metrics": {
@@ -666,13 +701,14 @@ class Tools:
             path = Path(page.image_ref)
             if path.exists() and path.is_file():
                 try:
-                    from skills.lettering_basic_v0.lettering import erase_page_image
+                    from skills.lettering_basic_v0.lettering import RemoteServiceError, erase_page_image
 
                     regions_payload = []
                     for region_id, region in sorted(page.regions.items()):
                         regions_payload.append(
                             {
                                 "region_id": int(region_id),
+                                "bbox_xyxy": region.bbox_xyxy,
                                 "bbox_xywh": region.bbox,
                                 "has_text_box": region.has_text_box,
                                 "color": region.color,
@@ -682,14 +718,28 @@ class Tools:
 
                     out = erase_page_image(image_bytes=path.read_bytes(), regions=regions_payload, skill_params=skill_params)
                     if not out.get("ok"):
-                        return {"ok": False, "error": out.get("error")}
+                        error = _normalize_tool_error(
+                            out.get("error"),
+                            default_code="erase_failed",
+                            default_message="Erase step failed.",
+                        )
+                        metrics = dict(out.get("metrics") or {})
+                        if error.get("kind") == "remote_service":
+                            metrics.update(_build_remote_service_metrics(error))
+                        job_dir = _resolve_page_job_dir(page)
+                        if job_dir is not None:
+                            write_json(
+                                page_skill_dir(job_dir, "lama_eraser", page.page_index) / "result.json",
+                                {"ok": False, "error": error, "metrics": metrics, "skill_params": skill_params or {}},
+                            )
+                        return {"ok": False, "error": error, "metrics": metrics}
 
                     erased_bytes = out.get("erased_image_bytes")
                     if isinstance(erased_bytes, (bytes, bytearray)):
-                        job_dir = path.parent.parent if path.parent.name == "pages" else path.parent
-                        erased_dir = job_dir / "erased"
+                        job_dir = _resolve_page_job_dir(page) or (path.parent.parent if path.parent.name == "pages" else path.parent)
+                        erased_dir = page_skill_dir(job_dir, "lama_eraser", page.page_index)
                         erased_dir.mkdir(parents=True, exist_ok=True)
-                        out_path = erased_dir / f"page_{page.page_index:04d}.png"
+                        out_path = erased_dir / "erased.png"
                         out_path.write_bytes(bytes(erased_bytes))
                         page.erased_image_ref = str(out_path)
 
@@ -698,34 +748,78 @@ class Tools:
                     overlay_bytes = out.get("mask_overlay_bytes")
                     mask_artifacts = {}
                     if any(isinstance(x, (bytes, bytearray)) for x in [coarse_mask_bytes, mask_bytes, overlay_bytes]):
-                        job_dir = path.parent.parent if path.parent.name == "pages" else path.parent
-                        masks_dir = job_dir / "masks"
+                        job_dir = _resolve_page_job_dir(page) or (path.parent.parent if path.parent.name == "pages" else path.parent)
+                        masks_dir = page_skill_dir(job_dir, "lama_eraser", page.page_index)
                         masks_dir.mkdir(parents=True, exist_ok=True)
-                        stem = f"page_{page.page_index:04d}"
                         if isinstance(coarse_mask_bytes, (bytes, bytearray)):
-                            coarse_path = masks_dir / f"{stem}_coarse.png"
+                            coarse_path = masks_dir / "mask_coarse.png"
                             coarse_path.write_bytes(bytes(coarse_mask_bytes))
                             mask_artifacts["coarse_mask_ref"] = str(coarse_path)
                         if isinstance(mask_bytes, (bytes, bytearray)):
-                            refined_path = masks_dir / f"{stem}_refined.png"
+                            refined_path = masks_dir / "mask_refined.png"
                             refined_path.write_bytes(bytes(mask_bytes))
                             mask_artifacts["refined_mask_ref"] = str(refined_path)
                         if isinstance(overlay_bytes, (bytes, bytearray)):
-                            overlay_path = masks_dir / f"{stem}_overlay.png"
+                            overlay_path = masks_dir / "mask_overlay.png"
                             overlay_path.write_bytes(bytes(overlay_bytes))
                             mask_artifacts["overlay_ref"] = str(overlay_path)
 
                     metrics = dict(out.get("metrics") or {})
                     if mask_artifacts:
                         metrics["mask_artifacts"] = mask_artifacts
+                    for region_id, region_result in (out.get("results") or {}).items():
+                        if region_id not in page.regions or not isinstance(region_result, dict):
+                            continue
+                        page.regions[region_id].placement_lines = region_result.get("placement_lines") or None
+                        page.regions[region_id].placement_source = region_result.get("placement_source")
+                    job_dir = _resolve_page_job_dir(page)
+                    if job_dir is not None:
+                        write_json(
+                            page_skill_dir(job_dir, "lama_eraser", page.page_index) / "result.json",
+                            {
+                                "ok": True,
+                                "erase_backend": metrics.get("erase_backend"),
+                                "results": out.get("results") or {},
+                                "metrics": metrics,
+                                "skill_params": skill_params or {},
+                            },
+                        )
                     return {
                         "ok": True,
                         "erase_backend": metrics.get("erase_backend"),
                         "results": out.get("results") or {},
                         "metrics": metrics,
                     }
+                except RemoteServiceError as e:
+                    error = e.to_dict()
+                    job_dir = _resolve_page_job_dir(page)
+                    if job_dir is not None:
+                        write_json(
+                            page_skill_dir(job_dir, "lama_eraser", page.page_index) / "result.json",
+                            {"ok": False, "error": error, "metrics": _build_remote_service_metrics(error), "skill_params": skill_params or {}},
+                        )
+                    return {
+                        "ok": False,
+                        "error": error,
+                        "metrics": _build_remote_service_metrics(error),
+                    }
                 except Exception as e:
-                    return {"ok": False, "error": {"code": "erase_exception", "message": str(e)}}
+                    job_dir = _resolve_page_job_dir(page)
+                    if job_dir is not None:
+                        write_json(
+                            page_skill_dir(job_dir, "lama_eraser", page.page_index) / "result.json",
+                            {
+                                "ok": False,
+                                "error": {"code": "erase_exception", "message": str(e)},
+                                "metrics": {"failure_kind": "unexpected_exception"},
+                                "skill_params": skill_params or {},
+                            },
+                        )
+                    return {
+                        "ok": False,
+                        "error": {"code": "erase_exception", "message": str(e)},
+                        "metrics": {"failure_kind": "unexpected_exception"},
+                    }
 
         # fallback mock for no-file demo runs
         return {"ok": True, "erase_backend": "mock", "results": {}, "metrics": {"erase_backend": "mock"}}
@@ -745,28 +839,53 @@ class Tools:
                         regions_payload.append(
                             {
                                 "region_id": int(region_id),
+                                "bbox_xyxy": region.bbox_xyxy,
                                 "bbox_xywh": region.bbox,
                                 "has_text_box": region.has_text_box,
                                 "color": region.color,
                                 "translated_text": region.translated_text or "",
+                                "placement_lines": region.placement_lines or [],
                             }
                         )
 
                     out = typeset_page_image(image_bytes=path.read_bytes(), regions=regions_payload, skill_params=skill_params)
                     if not out.get("ok"):
+                        job_dir = _resolve_page_job_dir(page)
+                        if job_dir is not None:
+                            write_json(
+                                page_skill_dir(job_dir, "lettering", page.page_index) / "result.json",
+                                {"ok": False, "error": out.get("error"), "skill_params": skill_params or {}},
+                            )
                         return {"ok": False, "error": out.get("error")}
 
                     rendered_bytes = out.get("rendered_image_bytes")
                     if isinstance(rendered_bytes, (bytes, bytearray)):
-                        job_dir = path.parent.parent if path.parent.name in {"pages", "erased"} else path.parent
-                        rendered_dir = job_dir / "rendered"
+                        job_dir = _resolve_page_job_dir(page) or (path.parent.parent if path.parent.name in {"pages", "erased"} else path.parent)
+                        rendered_dir = page_skill_dir(job_dir, "lettering", page.page_index)
                         rendered_dir.mkdir(parents=True, exist_ok=True)
-                        out_path = rendered_dir / f"page_{page.page_index:04d}.png"
+                        out_path = rendered_dir / "rendered.png"
                         out_path.write_bytes(bytes(rendered_bytes))
                         page.rendered_image_ref = str(out_path)
 
+                    job_dir = _resolve_page_job_dir(page)
+                    if job_dir is not None:
+                        write_json(
+                            page_skill_dir(job_dir, "lettering", page.page_index) / "result.json",
+                            {
+                                "ok": True,
+                                "results": out.get("results") or {},
+                                "metrics": out.get("metrics") or {},
+                                "skill_params": skill_params or {},
+                            },
+                        )
                     return {"ok": True, "results": out.get("results") or {}, "metrics": out.get("metrics") or {}}
                 except Exception as e:
+                    job_dir = _resolve_page_job_dir(page)
+                    if job_dir is not None:
+                        write_json(
+                            page_skill_dir(job_dir, "lettering", page.page_index) / "result.json",
+                            {"ok": False, "error": {"code": "typeset_exception", "message": str(e)}, "skill_params": skill_params or {}},
+                        )
                     return {"ok": False, "error": {"code": "typeset_exception", "message": str(e)}}
 
         # fallback mock for no-file demo runs

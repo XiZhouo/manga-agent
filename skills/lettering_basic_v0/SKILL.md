@@ -20,10 +20,27 @@ Required fields:
 - `page_index`: current page index
 - `regions`: list of translated regions
   - `region_id`
-  - `bbox_xywh`
+  - `bbox_xywh` / `bbox_xyxy` as fallback geometry
   - `has_text_box`
   - `color`
   - `translated_text`
+
+Preferred shape-aware fields:
+
+- `placement_lines`
+  - generated from the final erase mask, not from the raw VLM bbox
+  - each line describes one writable band inside the bubble
+  - recommended per-line fields:
+    - `x_left`
+    - `x_right`
+    - `y_top`
+    - `y_bottom`
+    - `x_center`
+    - `y_center`
+    - `usable_width`
+    - `usable_height`
+
+When `placement_lines` is present, lettering should prefer it over bbox-based rectangle fitting.
 
 Recommended metadata fields:
 
@@ -42,6 +59,10 @@ These are the knobs the Brain may choose from when retrying:
   - `bubble_fit`: default for `has_text_box=true`
   - `art_embed`: default for `has_text_box=false`; tighter padding, larger font search, stronger outline
   - the Brain should normally not override this unless page review says the auto-selected mode is wrong
+
+- `placement_source`
+  - `placement_lines`: preferred; use mask-derived writable bands
+  - `bbox`: fallback only when region-level placement lines are missing
 
 - `padding_ratio`
   - default `0.08`

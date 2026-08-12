@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import zipfile
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -9,6 +10,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from orchestrator import ComicAgent, DecisionEngine, InMemoryStateStore, Tools, JobStatus
+from orchestrator.job_io import (
+    build_job_id,
+    manifest_dir,
+    page_skill_dir,
+    resolve_job_dir_from_path,
+    skill_dir,
+    write_json,
+)
 from orchestrator.memory_store import LocalMemoryStore
 
 
@@ -57,7 +66,7 @@ def _normalize_input(input_path: Path, max_pages: Optional[int]) -> List[Dict[st
 
 
 def _write_job_pages(job_dir: Path, pages: List[Dict[str, Any]]) -> List[Tuple[int, str]]:
-    pages_dir = job_dir / "pages"
+    pages_dir = skill_dir(job_dir, "normalization") / "pages"
     pages_dir.mkdir(parents=True, exist_ok=True)
 
     page_refs: List[Tuple[int, str]] = []
@@ -77,7 +86,122 @@ def _write_job_pages(job_dir: Path, pages: List[Dict[str, Any]]) -> List[Tuple[i
     return page_refs
 
 
+def _resolve_job_dir_from_state(job_state) -> Optional[Path]:
+    pref = str((getattr(job_state, "user_preferences", {}) or {}).get("job_dir") or "").strip()
+    if pref:
+        return Path(pref)
+    for page in getattr(job_state, "pages", {}).values():
+        image_ref = str(getattr(page, "image_ref", "") or "").strip()
+        if image_ref:
+            return resolve_job_dir_from_path(Path(image_ref))
+    return None
+
+
+def _artifact_ref(job_dir: Optional[Path], raw_path: Optional[str]) -> Optional[str]:
+    if not raw_path:
+        return None
+    p = Path(str(raw_path))
+    if job_dir is not None:
+        try:
+            return str(p.relative_to(job_dir))
+        except Exception:
+            pass
+    return str(p)
+
+
+def _artifact_item(job_dir: Optional[Path], raw_path: Optional[str], *, missing_reason: Optional[str] = None) -> Dict[str, Any]:
+    ref = _artifact_ref(job_dir, raw_path)
+    exists = False
+    if raw_path:
+        try:
+            exists = Path(str(raw_path)).exists()
+        except Exception:
+            exists = False
+    item: Dict[str, Any] = {"ref": ref, "exists": bool(exists)}
+    if (not exists) and missing_reason:
+        item["missing_reason"] = str(missing_reason)
+    return item
+
+
+def _existing_artifact_item(job_dir: Optional[Path], path: Path, *, missing_reason: Optional[str] = None) -> Dict[str, Any]:
+    return _artifact_item(job_dir, str(path), missing_reason=missing_reason)
+
+
+def _page_artifact_missing_reason(name: str, page) -> Optional[str]:
+    page_type = str(getattr(page, "page_type", "content") or "content").strip().lower()
+    stage = str(getattr(page, "stage", "") or "").strip().lower()
+    error_stage = str(getattr(page, "page_error_stage", "") or "").strip().lower()
+
+    if name == "revision_result":
+        if getattr(page, "auto_revision_done", False) or getattr(page, "revision_usage", None) or getattr(page, "revision_batch_range", None):
+            return None
+        return "revision_not_run"
+
+    if name in {"erase_result", "erase_mask_coarse", "erase_mask_refined", "erase_mask_overlay", "erased_image"}:
+        if page_type in {"cover", "info"}:
+            return "erase_skipped_non_content"
+        if stage in {"not_started", "translating", "translated", "revising"}:
+            return "erase_not_run"
+        if error_stage == "erase":
+            return "erase_failed_before_artifact"
+        if stage in {"failed", "typesetting", "done"} and not getattr(page, "erase_ok", False):
+            return "erase_not_completed"
+        return "erase_artifact_missing"
+
+    if name in {"lettering_result", "rendered_image"}:
+        if page_type in {"cover", "info"}:
+            return "typeset_skipped_non_content"
+        if stage in {"not_started", "translating", "translated", "revising"}:
+            return "typeset_not_run"
+        if error_stage == "erase":
+            return "typeset_blocked_by_erase_failure"
+        if error_stage == "typeset":
+            return "typeset_failed_before_artifact"
+        if stage in {"erasing", "erased"}:
+            return "typeset_not_run"
+        return "typeset_artifact_missing"
+
+    if name == "vlm_result":
+        if stage == "not_started":
+            return "vlm_not_run"
+        return "vlm_artifact_missing"
+
+    if name == "normalized_page":
+        return "normalization_artifact_missing"
+
+    return None
+
+
+def _page_artifact_refs(job_dir: Optional[Path], page) -> Dict[str, Optional[str]]:
+    if job_dir is None:
+        return {
+            "normalized_page": _artifact_item(None, getattr(page, "image_ref", None), missing_reason=_page_artifact_missing_reason("normalized_page", page)),
+            "erased_image": _artifact_item(None, getattr(page, "erased_image_ref", None), missing_reason=_page_artifact_missing_reason("erased_image", page)),
+            "rendered_image": _artifact_item(None, getattr(page, "rendered_image_ref", None), missing_reason=_page_artifact_missing_reason("rendered_image", page)),
+        }
+
+    page_index = int(page.page_index)
+    vlm_dir = page_skill_dir(job_dir, "vlm_page_translate", page_index)
+    revision_dir = page_skill_dir(job_dir, "vlm_translation_revision", page_index)
+    erase_dir = page_skill_dir(job_dir, "lama_eraser", page_index)
+    lettering_dir = page_skill_dir(job_dir, "lettering", page_index)
+
+    return {
+        "normalized_page": _artifact_item(job_dir, getattr(page, "image_ref", None), missing_reason=_page_artifact_missing_reason("normalized_page", page)),
+        "vlm_result": _existing_artifact_item(job_dir, vlm_dir / "result.json", missing_reason=_page_artifact_missing_reason("vlm_result", page)),
+        "revision_result": _existing_artifact_item(job_dir, revision_dir / "result.json", missing_reason=_page_artifact_missing_reason("revision_result", page)),
+        "erase_result": _existing_artifact_item(job_dir, erase_dir / "result.json", missing_reason=_page_artifact_missing_reason("erase_result", page)),
+        "erase_mask_coarse": _existing_artifact_item(job_dir, erase_dir / "mask_coarse.png", missing_reason=_page_artifact_missing_reason("erase_mask_coarse", page)),
+        "erase_mask_refined": _existing_artifact_item(job_dir, erase_dir / "mask_refined.png", missing_reason=_page_artifact_missing_reason("erase_mask_refined", page)),
+        "erase_mask_overlay": _existing_artifact_item(job_dir, erase_dir / "mask_overlay.png", missing_reason=_page_artifact_missing_reason("erase_mask_overlay", page)),
+        "erased_image": _artifact_item(job_dir, getattr(page, "erased_image_ref", None), missing_reason=_page_artifact_missing_reason("erased_image", page)),
+        "lettering_result": _existing_artifact_item(job_dir, lettering_dir / "result.json", missing_reason=_page_artifact_missing_reason("lettering_result", page)),
+        "rendered_image": _artifact_item(job_dir, getattr(page, "rendered_image_ref", None), missing_reason=_page_artifact_missing_reason("rendered_image", page)),
+    }
+
+
 def _build_run_manifest(job_state) -> Dict[str, Any]:
+    job_dir = _resolve_job_dir_from_state(job_state)
     pages_out = []
     for page_index in sorted(job_state.pages.keys()):
         page = job_state.pages[page_index]
@@ -122,6 +246,12 @@ def _build_run_manifest(job_state) -> Dict[str, Any]:
                     "vlm_batch_id": getattr(page, "vlm_batch_id", None),
                 },
                 "stage": page.stage.value,
+                "page_error": {
+                    "message": getattr(page, "page_error_message", None),
+                    "stage": getattr(page, "page_error_stage", None),
+                    "code": getattr(page, "page_error_code", None),
+                    "details": getattr(page, "page_error_details", None),
+                },
                 "vlm": {
                     "quality_ok": getattr(page, "vlm_quality_ok", None),
                     "quality_reason": getattr(page, "vlm_quality_reason", None),
@@ -156,6 +286,7 @@ def _build_run_manifest(job_state) -> Dict[str, Any]:
                 "erase_metrics": getattr(page, "erase_metrics", None),
                 "lettering_ok": page.lettering_ok,
                 "typeset_metrics": getattr(page, "typeset_metrics", None),
+                "artifacts": _page_artifact_refs(job_dir, page),
                 "regions": regions_out,
                 }
             )
@@ -276,6 +407,24 @@ def _build_run_manifest(job_state) -> Dict[str, Any]:
                 "strategy_suggestions": getattr(job_state, "job_strategy_suggestions", None),
             },
         },
+        "artifact_roots": {
+            "job_dir": str(job_dir) if job_dir is not None else None,
+            "skill_outputs_dir": _artifact_ref(job_dir, str(job_dir / "skill_outputs")) if job_dir is not None else None,
+            "memory_dir": _artifact_ref(job_dir, str(job_dir / "memory")) if job_dir is not None else None,
+            "manifest_dir": _artifact_ref(job_dir, str(job_dir / "manifest")) if job_dir is not None else None,
+        },
+        "artifacts": {
+            "run_manifest": _artifact_item(job_dir, str(job_dir / "manifest" / "run_manifest.json") if job_dir is not None else None),
+            "glossary": _artifact_item(job_dir, str(job_dir / "manifest" / "glossary.json") if job_dir is not None else None),
+            "rag_bundle": _artifact_item(job_dir, str(job_dir / "manifest" / "rag_bundle.json") if job_dir is not None else None),
+            "vlm_batches": _artifact_item(job_dir, str(job_dir / "manifest" / "vlm_batches.json") if job_dir is not None else None),
+            "revision_batches": _artifact_item(job_dir, str(job_dir / "manifest" / "revision_batches.json") if job_dir is not None else None),
+            "brain_memory": _artifact_item(job_dir, str(job_dir / "memory" / "brain_memory.json") if job_dir is not None else None),
+            "translation_memory": _artifact_item(job_dir, str(job_dir / "memory" / "translation_memory.json") if job_dir is not None else None),
+            "project_memory": _artifact_item(job_dir, str(job_dir / "memory" / "project_memory.json") if job_dir is not None else None),
+            "style_memory": _artifact_item(job_dir, str(job_dir / "memory" / "style_memory.json") if job_dir is not None else None),
+            "experience_memory": _artifact_item(job_dir, str(job_dir / "memory" / "experience_memory.json") if job_dir is not None else None),
+        },
         "batch_views": {
             "vlm_windows": vlm_windows,
             "revision_windows": revision_windows,
@@ -320,12 +469,49 @@ def _build_glossary(job_state) -> Dict[str, Any]:
     return _default_glossary()
 
 
+def _refresh_manifest_artifact_flags(run_manifest: Dict[str, Any], *, job_dir: Path) -> None:
+    def _refresh_item(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        ref = item.get("ref")
+        if ref:
+            exists = (job_dir / str(ref)).exists()
+            item["exists"] = bool(exists)
+            if exists:
+                item.pop("missing_reason", None)
+        return item
+
+    artifacts = run_manifest.get("artifacts")
+    if isinstance(artifacts, dict):
+        for key, value in list(artifacts.items()):
+            artifacts[key] = _refresh_item(value)
+
+    page_views = run_manifest.get("page_views")
+    pages = (page_views or {}).get("pages") if isinstance(page_views, dict) else None
+    if isinstance(pages, list):
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            page_artifacts = page.get("artifacts")
+            if isinstance(page_artifacts, dict):
+                for key, value in list(page_artifacts.items()):
+                    page_artifacts[key] = _refresh_item(value)
+
+    flat_pages = run_manifest.get("pages")
+    if isinstance(flat_pages, list):
+        for page in flat_pages:
+            if not isinstance(page, dict):
+                continue
+            page_artifacts = page.get("artifacts")
+            if isinstance(page_artifacts, dict):
+                for key, value in list(page_artifacts.items()):
+                    page_artifacts[key] = _refresh_item(value)
+
+
 def _package_zip(output_zip: Path, *, job_dir: Path, run_manifest: Dict[str, Any], glossary: Dict[str, Any], rag_bundle: Dict[str, Any]) -> None:
     output_zip.parent.mkdir(parents=True, exist_ok=True)
 
-    pages_dir = job_dir / "pages"
-    erased_dir = job_dir / "erased"
-    rendered_dir = job_dir / "rendered"
+    skill_outputs_root = job_dir / "skill_outputs"
     memory_dir = job_dir / "memory"
     with zipfile.ZipFile(output_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         # job artifacts
@@ -335,23 +521,10 @@ def _package_zip(output_zip: Path, *, job_dir: Path, run_manifest: Dict[str, Any
         zf.writestr("vlm_batches.json", json.dumps(run_manifest.get("vlm_batches") or [], ensure_ascii=False, indent=2))
         zf.writestr("revision_batches.json", json.dumps(run_manifest.get("revision_batches") or [], ensure_ascii=False, indent=2))
 
-        # original pages
-        if pages_dir.exists():
-            for p in sorted(pages_dir.glob("page_*")):
+        if skill_outputs_root.exists():
+            for p in sorted(skill_outputs_root.rglob("*")):
                 if p.is_file():
-                    zf.write(p, arcname=f"pages/{p.name}")
-
-        # erased pages (cached for re-typesetting)
-        if erased_dir.exists():
-            for p in sorted(erased_dir.glob("page_*")):
-                if p.is_file():
-                    zf.write(p, arcname=f"erased/{p.name}")
-
-        # rendered pages (lettered)
-        if rendered_dir.exists():
-            for p in sorted(rendered_dir.glob("page_*")):
-                if p.is_file():
-                    zf.write(p, arcname=f"rendered/{p.name}")
+                    zf.write(p, arcname=f"skill_outputs/{p.relative_to(skill_outputs_root)}")
 
         if memory_dir.exists():
             for p in sorted(memory_dir.glob("*.json")):
@@ -361,29 +534,29 @@ def _package_zip(output_zip: Path, *, job_dir: Path, run_manifest: Dict[str, Any
 
 def _write_artifacts(job_dir: Path, *, run_manifest: Dict[str, Any], glossary: Dict[str, Any], rag_bundle: Dict[str, Any]) -> None:
     job_dir.mkdir(parents=True, exist_ok=True)
-    (job_dir / "run_manifest.json").write_text(
-        json.dumps(run_manifest, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    (job_dir / "glossary.json").write_text(
-        json.dumps(glossary, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    (job_dir / "rag_bundle.json").write_text(
-        json.dumps(rag_bundle, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    (job_dir / "vlm_batches.json").write_text(
-        json.dumps(run_manifest.get("vlm_batches") or [], ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    (job_dir / "revision_batches.json").write_text(
-        json.dumps(run_manifest.get("revision_batches") or [], ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    out_dir = manifest_dir(job_dir)
+    write_json(out_dir / "glossary.json", glossary)
+    write_json(out_dir / "rag_bundle.json", rag_bundle)
+    write_json(out_dir / "vlm_batches.json", run_manifest.get("vlm_batches") or [])
+    write_json(out_dir / "revision_batches.json", run_manifest.get("revision_batches") or [])
+
+    # Keep root-level copies for backward compatibility with older scripts.
+    write_json(job_dir / "glossary.json", glossary)
+    write_json(job_dir / "rag_bundle.json", rag_bundle)
+    write_json(job_dir / "vlm_batches.json", run_manifest.get("vlm_batches") or [])
+    write_json(job_dir / "revision_batches.json", run_manifest.get("revision_batches") or [])
+
+    # Write manifest after sibling artifacts exist so its navigational exists-flags are accurate.
+    _refresh_manifest_artifact_flags(run_manifest, job_dir=job_dir)
+    manifest_artifacts = run_manifest.get("artifacts")
+    if isinstance(manifest_artifacts, dict) and isinstance(manifest_artifacts.get("run_manifest"), dict):
+        manifest_artifacts["run_manifest"]["exists"] = True
+        manifest_artifacts["run_manifest"].pop("missing_reason", None)
+    write_json(out_dir / "run_manifest.json", run_manifest)
+    write_json(job_dir / "run_manifest.json", run_manifest)
 
 
-def main() -> None:
+def _build_pipeline_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manga Translation Agent (orchestrator-driven)")
     parser.add_argument("--input", "-i", type=str, required=True, help="Input file (pdf/zip/cbz/cbr/rar/jpg/png) or a directory of images")
     parser.add_argument("--output", "-o", type=str, default="data/output", help="Output directory")
@@ -410,7 +583,12 @@ def main() -> None:
     )
     parser.add_argument("--rag-bundle", type=str, default="", help="Optional path to a prior rag_bundle.json to import before this run.")
     parser.add_argument("--user-id", type=str, default="cli", help="User id")
-    args = parser.parse_args()
+    return parser
+
+
+def run_pipeline_cli(argv: Optional[List[str]] = None) -> int:
+    parser = _build_pipeline_parser()
+    args = parser.parse_args(argv)
 
     input_path = Path(args.input)
     if not input_path.exists():
@@ -442,11 +620,14 @@ def main() -> None:
 
     # Create job_id first by creating the job, then write pages under that folder.
     # We create a temporary job with placeholder refs, then rewrite them.
+    job_id = build_job_id(input_path.name)
     job_id = agent.create_job(
         user_id=args.user_id,
         source_file_name=input_path.name,
         target_language=args.target_language,
         pages=[(p["page_index"], "") for p in pages],
+        job_id=job_id,
+        job_dir=str(job_root / job_id),
     )
 
     job_dir = job_root / job_id
@@ -509,7 +690,80 @@ def main() -> None:
             print("last_log:", job_state.logs[-1])
     if job_state.status in {JobStatus.WAITING_USER, JobStatus.FAILED}:
         print("waiting_reason:", job_state.waiting_reason)
+    return 0
+
+
+def run_chat_cli(*, cwd: Optional[Path] = None) -> int:
+    from orchestrator.chat_controller import ChatController
+
+    workdir = (cwd or Path.cwd()).resolve()
+    store = InMemoryStateStore()
+    agent = ComicAgent(store=store, tools=Tools(), decision_engine=DecisionEngine())
+    controller = ChatController(agent=agent, cwd=workdir)
+
+    active_job_id = None
+    print("Manga Brain CLI 已启动。输入 /quit 退出。")
+
+    while True:
+        try:
+            msg = input("\n你> ").strip()
+        except EOFError:
+            print()
+            break
+        if not msg:
+            continue
+        if msg in {"/quit", "/exit"}:
+            break
+
+        resp = controller.handle_message(msg, active_job_id=active_job_id)
+        print(f"\nBrain> {resp.get('message')}")
+        if resp.get("job_id"):
+            active_job_id = str(resp["job_id"])
+
+    return 0
+
+
+def _print_main_help() -> None:
+    print(
+        "\n".join(
+            [
+                "Manga Agent",
+                "",
+                "默认直接启动 Brain 聊天：",
+                "  python main.py",
+                "",
+                "正式批处理运行入口：",
+                "  python main.py run --input <comic.cbz> --pipeline-mode vlm --target-language zh",
+                "  python run_pipeline.py --input <comic.cbz> --pipeline-mode vlm --target-language zh",
+                "",
+                "兼容旧用法：",
+                "  python main.py --input <comic.cbz> --pipeline-mode vlm --target-language zh",
+            ]
+        )
+    )
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        return run_chat_cli()
+
+    if args[0] in {"-h", "--help", "help"}:
+        _print_main_help()
+        return 0
+
+    if args[0] == "chat":
+        return run_chat_cli()
+
+    if args[0] == "run":
+        return run_pipeline_cli(args[1:])
+
+    if any(arg in {"--input", "-i"} for arg in args):
+        return run_pipeline_cli(args)
+
+    _print_main_help()
+    return 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

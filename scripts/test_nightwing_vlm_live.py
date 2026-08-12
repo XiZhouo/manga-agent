@@ -16,7 +16,7 @@ from skills.input_normalization.normalize import normalize_file
 
 
 DEFAULT_INPUT = Path("mangatest") / "Nightwing 124 (2025) (Pyrate-DCP).cbz"
-DEFAULT_OUTPUT = Path("data/test_runs/nightwing_vlm_live")
+DEFAULT_OUTPUT = Path("data/test_runs/translate/nightwing_vlm_live")
 
 
 def _sanitize(obj: Any) -> Any:
@@ -34,6 +34,28 @@ def _sanitize(obj: Any) -> Any:
 def _write_json(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(_sanitize(data), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _compact_vlm_result(page_index: int, result: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "page_index": page_index,
+        "page_type": result.get("page_type"),
+        "original_image_size": result.get("original_image_size"),
+        "sent_image_size": result.get("sent_image_size"),
+        "coordinate_space": result.get("coordinate_space"),
+        "bbox_error": bool(result.get("bbox_error", False)),
+        "regions": result.get("regions") or [],
+    }
+
+
+def _debug_vlm_result(page_index: int, result: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "page_index": page_index,
+        "ok": bool(result.get("ok")),
+        "error": result.get("error"),
+        "vlm_metrics": result.get("vlm_metrics"),
+        "raw": result.get("raw"),
+    }
 
 
 def _append_progress(path: Path, message: str) -> None:
@@ -111,7 +133,8 @@ def main() -> None:
         t0 = time.time()
         result = tools.run_vlm_page(page)
         duration_sec = round(time.time() - t0, 3)
-        _write_json(page_dir / "vlm_result.json", result)
+        _write_json(page_dir / "vlm_result.json", _compact_vlm_result(page_index, result))
+        _write_json(page_dir / "vlm_debug.json", _debug_vlm_result(page_index, result))
 
         page_summary = {
             "page_index": page_index,

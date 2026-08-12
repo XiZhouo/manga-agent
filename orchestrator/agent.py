@@ -3,9 +3,9 @@ from __future__ import annotations
 import os
 import re
 import time
-import uuid
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Optional, Tuple, List, Any, Dict
 
 from .state import (
@@ -23,6 +23,8 @@ from .decision_engine import DecisionEngine
 from .tools import Tools
 from .brain import DecisionBrain
 from .memory_store import LocalMemoryStore, utc_iso
+from .shared_memory_store import SQLiteSharedMemoryStore
+from .job_io import build_job_id, page_skill_dir, resolve_job_dir_from_path, write_json
 from .retrieval import RetrievalContextBuilder
 from .skill_specs import (
     build_skill_context_for_brain,
@@ -30,6 +32,26 @@ from .skill_specs import (
     sanitize_skill_param_suggestions,
     sanitize_strategy_suggestions,
 )
+from qa import evaluate_erase_page, evaluate_vlm_page
+
+
+def _normalize_page_error(raw_error: Any, *, stage: str, fallback_message: str) -> Dict[str, Any]:
+    if isinstance(raw_error, dict):
+        error = dict(raw_error)
+    else:
+        error = {"message": str(raw_error or fallback_message)}
+    error.setdefault("stage", stage)
+    error.setdefault("code", f"{stage}_failed")
+    error.setdefault("message", fallback_message)
+    return error
+
+
+def _human_page_error_message(error: Dict[str, Any], *, default_message: str) -> str:
+    code = str(error.get("code") or "").strip().lower()
+    message = str(error.get("message") or "").strip()
+    if error.get("kind") == "remote_service" or "service_unreachable" in code or "service_unavailable" in code or "timeout" in code:
+        return f"Erase blocked: {message or 'Remote erase service is unavailable or not responding.'}"
+    return default_message
 
 
 class SimpleMemory:
@@ -43,13 +65,65 @@ class SimpleMemory:
 
     def __init__(self) -> None:
         self.store = LocalMemoryStore()
+        self.shared_store = SQLiteSharedMemoryStore()
         self.retrieval = RetrievalContextBuilder()
 
     def initialize_job(self, job: JobState) -> None:
         self.store.ensure_initialized(job)
 
     def snapshot(self, job: JobState) -> Dict[str, Any]:
-        return self.store.snapshot(job)
+        local = self.store.snapshot(job)
+        shared = self.shared_store.snapshot_for_job(job)
+        merged = dict(local)
+        for bucket, shared_bucket in shared.items():
+            if bucket not in merged:
+                merged[bucket] = shared_bucket
+                continue
+            local_entries = [x for x in (merged.get(bucket, {}) or {}).get("entries", []) if isinstance(x, dict)]
+            shared_entries = [x for x in (shared_bucket or {}).get("entries", []) if isinstance(x, dict)]
+            merged[bucket] = dict(merged[bucket])
+            merged[bucket]["entries"] = self._merge_bucket_entries(bucket, local_entries, shared_entries)
+        return merged
+
+    def _merge_bucket_entries(
+        self,
+        bucket: str,
+        local_entries: List[Dict[str, Any]],
+        shared_entries: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        merged: Dict[tuple[str, ...], Dict[str, Any]] = {}
+
+        def _key(entry: Dict[str, Any]) -> tuple[str, ...]:
+            if bucket == "experience_memory":
+                return (
+                    str(entry.get("kind") or ""),
+                    str(entry.get("src_text") or "").strip(),
+                    str(entry.get("tgt_text") or "").strip(),
+                    str(entry.get("recommended_action") or "").strip(),
+                )
+            return (
+                str(entry.get("type") or entry.get("glossary_type") or ""),
+                str(entry.get("src_text") or "").strip(),
+                str(entry.get("tgt_text") or "").strip(),
+            )
+
+        def _pick(new_entry: Dict[str, Any], old_entry: Dict[str, Any]) -> Dict[str, Any]:
+            if not old_entry:
+                return new_entry
+            new_time = str(new_entry.get("updated_at") or "")
+            old_time = str(old_entry.get("updated_at") or "")
+            return new_entry if new_time >= old_time else old_entry
+
+        for entry in shared_entries + local_entries:
+            key = _key(entry)
+            if key not in merged:
+                merged[key] = dict(entry)
+            else:
+                merged[key] = _pick(dict(entry), merged[key])
+
+        ordered = list(merged.values())
+        ordered.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        return ordered
 
     def update_preferences(self, job: JobState, user_message: str) -> None:
         if "中文" in user_message:
@@ -58,16 +132,66 @@ class SimpleMemory:
             job.user_preferences["target_language"] = "en"
         if "更夸张" in user_message:
             job.user_preferences["sfx_style"] = "exaggerated"
-            self.store.add_style_hint(job, message=user_message, key="sfx_style", value="exaggerated")
+            style_entry = {
+                "type": "style",
+                "src_text": "sfx_style",
+                "tgt_text": "exaggerated",
+                "scope": "project",
+                "source": "user_message",
+                "note": user_message,
+            }
+            self.store.upsert_entries(job, "style_memory", [style_entry])
+            self.shared_store.upsert_entries(job, "style_memory", [style_entry])
         if "术语统一" in user_message:
             job.user_preferences["strict_glossary"] = True
-            self.store.add_project_rule(job, message=user_message, key="strict_glossary", value="enabled")
+            project_entry = {
+                "type": "rule",
+                "src_text": "strict_glossary",
+                "tgt_text": "enabled",
+                "scope": "project",
+                "source": "user_message",
+                "note": user_message,
+            }
+            self.store.upsert_entries(job, "project_memory", [project_entry])
+            self.shared_store.upsert_entries(job, "project_memory", [project_entry])
+
+    def _log_shared_usage_from_context(
+        self,
+        job: JobState,
+        *,
+        route: str,
+        context: Dict[str, Any],
+        page_index: Optional[int] = None,
+    ) -> None:
+        if not isinstance(context, dict):
+            return
+
+        for key, value in context.items():
+            if not isinstance(value, list):
+                continue
+            entries = [x for x in value if isinstance(x, dict)]
+            if not entries:
+                continue
+            try:
+                self.shared_store.log_usage(
+                    entries=entries,
+                    route=route,
+                    job_id=str(getattr(job, "job_id", "") or "").strip() or None,
+                    page_index=page_index,
+                    reason=str(key),
+                )
+            except Exception:
+                continue
 
     def build_vlm_retrieval(self, job: JobState, page: PageState) -> Dict[str, Any]:
-        return self.retrieval.build_for_vlm(job, page, self.snapshot(job))
+        context = self.retrieval.build_for_vlm(job, page, self.snapshot(job))
+        self._log_shared_usage_from_context(job, route="vlm", context=context, page_index=page.page_index)
+        return context
 
     def build_translation_retrieval(self, job: JobState, page: PageState) -> Dict[str, Any]:
-        return self.retrieval.build_for_translation(job, page, self.snapshot(job))
+        context = self.retrieval.build_for_translation(job, page, self.snapshot(job))
+        self._log_shared_usage_from_context(job, route="translation", context=context, page_index=page.page_index)
+        return context
 
     def build_revision_retrieval(
         self,
@@ -76,10 +200,46 @@ class SimpleMemory:
         pages: List[PageState],
         document_range: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        return self.retrieval.build_for_revision(job, pages, self.snapshot(job), document_range=document_range)
+        context = self.retrieval.build_for_revision(job, pages, self.snapshot(job), document_range=document_range)
+        page_index = pages[0].page_index if pages else None
+        self._log_shared_usage_from_context(job, route="revision", context=context, page_index=page_index)
+        return context
 
     def build_brain_context(self, job: JobState, *, user_message: str) -> Dict[str, Any]:
-        return self.retrieval.build_for_brain(job, user_message=user_message, snapshot=self.snapshot(job))
+        context = self.retrieval.build_for_brain(job, user_message=user_message, snapshot=self.snapshot(job))
+        self._log_shared_usage_from_context(job, route="job_user_message", context=context)
+        return context
+
+    def build_chat_context(self, job: JobState, *, user_message: str) -> Dict[str, Any]:
+        context = self.retrieval.build_for_chat(job, user_message=user_message, snapshot=self.snapshot(job))
+        self._log_shared_usage_from_context(job, route="chat", context=context)
+        return context
+
+    def build_progress_context(self, job: JobState, *, user_message: str) -> Dict[str, Any]:
+        context = self.retrieval.build_for_progress(job, user_message=user_message, snapshot=self.snapshot(job))
+        self._log_shared_usage_from_context(job, route="progress", context=context)
+        return context
+
+    def build_technical_context(
+        self,
+        job: JobState,
+        *,
+        user_message: str,
+        page_summary: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        context = self.retrieval.build_for_technical_decision(
+            job,
+            user_message=user_message,
+            page_summary=page_summary,
+            snapshot=self.snapshot(job),
+        )
+        page_index = page_summary.get("page_index") if isinstance(page_summary, dict) else None
+        try:
+            page_index = int(page_index) if page_index is not None else None
+        except Exception:
+            page_index = None
+        self._log_shared_usage_from_context(job, route="technical_decision", context=context, page_index=page_index)
+        return context
 
     def record_brain_event(
         self,
@@ -138,6 +298,7 @@ class SimpleMemory:
 
         if glossary_entries:
             self.store.upsert_entries(job, "glossary", glossary_entries)
+            self.shared_store.upsert_entries(job, "glossary", glossary_entries)
 
         tm_entries: List[Dict[str, Any]] = []
         for patch in patches:
@@ -173,6 +334,7 @@ class SimpleMemory:
 
         if tm_entries:
             self.store.upsert_entries(job, "translation_memory", tm_entries)
+            self.shared_store.upsert_entries(job, "translation_memory", tm_entries)
 
         self.store.sync_job_glossary(job)
 
@@ -203,6 +365,65 @@ class ComicAgent:
         self.decision_engine = decision_engine
         self.memory = memory or SimpleMemory()
         self.brain = brain or DecisionBrain()
+
+    def _resolve_job_dir(self, job: JobState) -> Path:
+        pref = str((job.user_preferences or {}).get("job_dir") or "").strip()
+        if pref:
+            return Path(pref)
+        for page in getattr(job, "pages", {}).values():
+            image_ref = str(getattr(page, "image_ref", "") or "").strip()
+            if not image_ref:
+                continue
+            return resolve_job_dir_from_path(Path(image_ref))
+        return Path("data/jobs") / str(job.job_id)
+
+    def _write_page_skill_artifact(
+        self,
+        job: JobState,
+        *,
+        skill_name: str,
+        page_index: int,
+        filename: str,
+        data: Dict[str, Any],
+    ) -> None:
+        out_dir = page_skill_dir(self._resolve_job_dir(job), skill_name, page_index)
+        write_json(out_dir / filename, data)
+
+    def _append_experience(
+        self,
+        job: JobState,
+        *,
+        kind: str,
+        note: str,
+        situation: Dict[str, Any],
+        recommended_action: Optional[str] = None,
+        skill_params: Optional[Dict[str, Any]] = None,
+        tags: Optional[List[str]] = None,
+        confidence: Optional[float] = None,
+    ) -> None:
+        try:
+            self.memory.store.append_experience_event(
+                job,
+                kind=kind,
+                note=note,
+                situation=situation,
+                recommended_action=recommended_action,
+                skill_params=skill_params,
+                tags=tags,
+                confidence=confidence,
+            )
+            self.memory.shared_store.append_experience_event(
+                job,
+                kind=kind,
+                note=note,
+                situation=situation,
+                recommended_action=recommended_action,
+                skill_params=skill_params,
+                tags=tags,
+                confidence=confidence,
+            )
+        except Exception as e:
+            job.logs.append(f"Experience memory append skipped/failed: {e}")
 
     def _resolve_plan_page_index(self, job: JobState, plan: Dict[str, Any]) -> Optional[int]:
         page_index = None
@@ -538,6 +759,7 @@ class ComicAgent:
                 job_summary=self._build_job_summary_for_brain(job),
                 pipeline_mode=str(job.user_preferences.get("pipeline_mode") or "classic").lower(),
                 target_language=job.target_language,
+                memory_context=self.memory.build_progress_context(job, user_message=f"job_strategy:{trigger}"),
                 skill_context=build_skill_context_for_brain(),
             )
         except Exception as e:
@@ -572,11 +794,19 @@ class ComicAgent:
         overflow_regions = sum(1 for r in regions if bool(r.render_overflow))
         bad_render_regions = sum(1 for r in regions if (not r.render_ok) or bool(r.render_overflow))
         embedded_ratio = (embedded_regions / float(total_regions)) if total_regions else 0.0
+        vlm_qa = page.qa_reports.get("vlm") if isinstance(page.qa_reports.get("vlm"), dict) else {}
+        erase_qa = page.qa_reports.get("erase") if isinstance(page.qa_reports.get("erase"), dict) else {}
+        typeset_qa = page.qa_reports.get("typeset") if isinstance(page.qa_reports.get("typeset"), dict) else {}
+        erase_service_error = ((page.erase_metrics or {}).get("service_error")) if isinstance(page.erase_metrics, dict) else None
 
         return {
             "page_index": page.page_index,
             "page_type": page.page_type,
             "stage": page.stage.value,
+            "page_error_message": page.page_error_message,
+            "page_error_stage": page.page_error_stage,
+            "page_error_code": page.page_error_code,
+            "page_error_details": page.page_error_details or {},
             "regions_total": total_regions,
             "boxed_regions": boxed_regions,
             "embedded_regions": embedded_regions,
@@ -589,19 +819,36 @@ class ComicAgent:
             "vlm_judge_decision": page.vlm_judge_decision,
             "vlm_judge_reason_code": page.vlm_judge_reason_code,
             "retry_count_vlm": page.retry_count_vlm,
+            "vlm_qa": vlm_qa,
+            "vlm_qa_status": vlm_qa.get("status"),
+            "vlm_qa_score": vlm_qa.get("score"),
+            "vlm_qa_retry_hint": vlm_qa.get("retry_hint") or {},
+            "vlm_qa_issue_count": len(vlm_qa.get("issues") or []),
             "auto_revision_done": page.auto_revision_done,
             "auto_revision_changed": page.auto_revision_changed,
             "erase_ok": page.erase_ok,
             "erase_backend": page.erase_backend,
             "erase_metrics": page.erase_metrics or {},
+            "erase_qa": erase_qa,
+            "erase_qa_status": erase_qa.get("status"),
+            "erase_qa_score": erase_qa.get("score"),
+            "erase_qa_retry_hint": erase_qa.get("retry_hint") or {},
+            "erase_qa_issue_count": len(erase_qa.get("issues") or []),
             "erase_mask_quality": ((page.erase_metrics or {}).get("mask_quality")),
             "erase_mask_quality_reason": ((page.erase_metrics or {}).get("mask_quality_reason")),
             "erase_mask_strategy": ((page.erase_metrics or {}).get("mask_strategy")),
             "erase_mask_coverage": ((page.erase_metrics or {}).get("mask_coverage")),
             "erase_embedded_regions": ((page.erase_metrics or {}).get("embedded_regions")),
             "erase_mask_retry_hint": ((page.erase_metrics or {}).get("mask_retry_hint") or {}),
+            "erase_service_error": erase_service_error or {},
+            "erase_service_unavailable": bool(isinstance(erase_service_error, dict) and erase_service_error),
             "lettering_ok": page.lettering_ok,
             "typeset_metrics": page.typeset_metrics or {},
+            "typeset_qa": typeset_qa,
+            "typeset_qa_status": typeset_qa.get("status"),
+            "typeset_qa_score": typeset_qa.get("score"),
+            "typeset_qa_retry_hint": (typeset_qa.get("retry_hint") or {}),
+            "typeset_qa_issue_count": len(typeset_qa.get("issues") or []),
             "retry_count_erase": page.retry_count_erase,
             "has_erased_image": bool(page.erased_image_ref),
             "has_rendered_image": bool(page.rendered_image_ref),
@@ -613,10 +860,16 @@ class ComicAgent:
         if not hasattr(self.brain, "suggest_page_strategy"):
             return
         try:
+            technical_context = self.memory.build_technical_context(
+                job,
+                user_message=f"page_strategy:{trigger}",
+                page_summary=self._build_page_summary_for_brain(page),
+            )
             suggested = self.brain.suggest_page_strategy(
                 page_summary=self._build_page_summary_for_brain(page),
                 pipeline_mode=str(job.user_preferences.get("pipeline_mode") or "classic").lower(),
                 target_language=job.target_language,
+                memory_context=technical_context,
                 skill_context=build_skill_context_for_brain(),
             )
         except Exception as e:
@@ -653,6 +906,8 @@ class ComicAgent:
         source_file_name: str,
         target_language: str,
         pages: List[Tuple[int, str]],
+        job_id: Optional[str] = None,
+        job_dir: Optional[str] = None,
     ) -> str:
         """
         pages: [(page_index, image_ref), ...]
@@ -661,7 +916,7 @@ class ComicAgent:
         - 对象存储 key
         - 其它资源引用
         """
-        job_id = str(uuid.uuid4())
+        job_id = str(job_id or build_job_id(source_file_name))
 
         job = JobState(
             job_id=job_id,
@@ -671,6 +926,8 @@ class ComicAgent:
             status=JobStatus.CREATED,
             vlm_batch_size=max(1, min(10, int(os.getenv("MANGA_AGENT_VLM_BATCH_SIZE", "10")))),
         )
+        if job_dir:
+            job.user_preferences["job_dir"] = str(job_dir)
 
         # Initialize glossary bucket for in-job corrections (RAG / translation memory).
         job.glossary = {
@@ -953,7 +1210,7 @@ class ComicAgent:
                 regions_payload.append(
                     {
                         "region_id": r.region_id,
-                        "bbox_xywh": r.bbox,
+                        "bbox_xyxy": r.bbox_xyxy,
                         "has_text_box": r.has_text_box,
                         "color": r.color,
                         "src_text": r.ocr_text or "",
@@ -994,6 +1251,23 @@ class ComicAgent:
             glossary=job.glossary or {},
             retrieval_context=retrieval_context,
         )
+
+        revision_artifact = {
+            "document_range": document_range,
+            "revision_mode": revision_mode,
+            "user_request": user_request,
+            "request_pages": pages_payload,
+            "result": result,
+        }
+        for pi in target_page_indices:
+            if pi in job.pages:
+                self._write_page_skill_artifact(
+                    job,
+                    skill_name="vlm_translation_revision",
+                    page_index=pi,
+                    filename="result.json",
+                    data=revision_artifact,
+                )
 
         if not result.get("ok"):
             err = result.get("error") or {}
@@ -1245,12 +1519,27 @@ class ComicAgent:
         batch_range: Optional[Dict[str, Any]] = None,
         batch_id: Optional[str] = None,
     ) -> None:
+        def _xyxy_to_xywh(box: Optional[List[int]]) -> Optional[List[int]]:
+            if not (isinstance(box, list) and len(box) == 4):
+                return None
+            try:
+                x1, y1, x2, y2 = [int(v) for v in box]
+            except Exception:
+                return None
+            x = min(x1, x2)
+            y = min(y1, y2)
+            w = max(1, abs(x2 - x1))
+            h = max(1, abs(y2 - y1))
+            return [x, y, w, h]
+
         page.regions.clear()
         for item in result.get("regions", []) or []:
             region_id = int(item["region_id"])
+            bbox_xyxy = item.get("bbox_xyxy")
             page.regions[region_id] = RegionState(
                 region_id=region_id,
-                bbox=item.get("bbox"),
+                bbox=item.get("bbox_xywh") or item.get("bbox") or _xyxy_to_xywh(bbox_xyxy),
+                bbox_xyxy=bbox_xyxy,
                 region_type=item.get("region_type", "text"),
                 has_text_box=item.get("has_text_box"),
                 color=str(item.get("color") or "black"),
@@ -1280,6 +1569,7 @@ class ComicAgent:
         page.rendered_image_ref = None
         page.lettering_ok = False
         page.typeset_metrics = None
+        page.qa_reports = {}
         page.stage = PageStage.TRANSLATED
         page.needs_manual_rerun = False
         page.vlm_batch_range = dict(batch_range) if isinstance(batch_range, dict) else None
@@ -1311,7 +1601,8 @@ class ComicAgent:
             self._refresh_page_brain_strategy(job, page, trigger="after_vlm_page")
             return
 
-        q_ok, q_reason, q_warn = self._evaluate_vlm_page_quality(job, page, target_language=target_language)
+        vlm_qa, q_ok, q_reason, q_warn = self._evaluate_vlm_page_quality(job, page, target_language=target_language)
+        page.qa_reports["vlm"] = vlm_qa
         page.vlm_quality_ok = q_ok
         page.vlm_quality_reason = q_reason
         page.vlm_warnings = q_warn
@@ -1416,6 +1707,26 @@ class ComicAgent:
                 job,
                 f"Page {page.page_index}: VLM quality not ok: {page.vlm_quality_reason} warnings={page.vlm_warnings}",
             )
+            self._append_experience(
+                job,
+                kind="failure_pattern",
+                note=f"VLM page quality rejected ({page.vlm_quality_reason or 'unknown'}).",
+                situation={
+                    "stage": "vlm",
+                    "page_type": page.page_type,
+                    "error_code": page.vlm_quality_reason,
+                    "judge_decision": page.vlm_judge_decision,
+                    "judge_reason_code": page.vlm_judge_reason_code,
+                    "downscaled": page.vlm_downscaled,
+                },
+                recommended_action=(
+                    "retry_vlm_page"
+                    if str(page.vlm_quality_reason or "").strip().lower() not in {"judge_ask_user"}
+                    else "ask_user"
+                ),
+                tags=["vlm", "quality"],
+                confidence=0.65,
+            )
 
         self._refresh_page_brain_strategy(job, page, trigger="after_vlm_page")
 
@@ -1443,6 +1754,13 @@ class ComicAgent:
             page.vlm_quality_reason = str(err.get("code") or "vlm_failed")
             page.vlm_warnings = [str(err.get("message") or "VLM core failed")]
             self._log(job, f"Page {page.page_index}: VLM core failed.")
+            self._write_page_skill_artifact(
+                job,
+                skill_name="vlm_page_translate",
+                page_index=page.page_index,
+                filename="result.json",
+                data={"result": result, "page_summary": self._build_page_summary_for_brain(page)},
+            )
             return
 
         self._apply_vlm_success_to_page(
@@ -1452,6 +1770,13 @@ class ComicAgent:
             target_language=target_language,
             reading_direction=reading_direction,
             source_language=source_language,
+        )
+        self._write_page_skill_artifact(
+            job,
+            skill_name="vlm_page_translate",
+            page_index=page.page_index,
+            filename="result.json",
+            data={"result": result, "page_summary": self._build_page_summary_for_brain(page)},
         )
 
     def _do_vlm_batch(self, job: JobState, *, page_indices: List[int], target_language: str) -> None:
@@ -1491,6 +1816,18 @@ class ComicAgent:
                 page.vlm_warnings = [str(err.get("message") or "VLM batch failed")]
                 page.vlm_batch_range = dict(batch_range)
                 page.vlm_batch_id = batch_id
+                self._write_page_skill_artifact(
+                    job,
+                    skill_name="vlm_page_translate",
+                    page_index=page.page_index,
+                    filename="result.json",
+                    data={
+                        "batch_id": batch_id,
+                        "batch_range": batch_range,
+                        "result": result,
+                        "page_summary": self._build_page_summary_for_brain(page),
+                    },
+                )
             self._log(job, f"VLM batch {batch_range.get('label')}: failed code={err.get('code')} msg={err.get('message')}")
             return
 
@@ -1526,6 +1863,18 @@ class ComicAgent:
                 page.vlm_batch_range = dict(batch_range)
                 page.vlm_batch_id = batch_id
                 self._log(job, f"Page {page.page_index}: missing from VLM batch result.")
+                self._write_page_skill_artifact(
+                    job,
+                    skill_name="vlm_page_translate",
+                    page_index=page.page_index,
+                    filename="result.json",
+                    data={
+                        "batch_id": batch_id,
+                        "batch_range": batch_range,
+                        "result": {"ok": False, "error": {"code": "vlm_batch_missing_page_result", "message": "VLM batch did not return this page."}},
+                        "page_summary": self._build_page_summary_for_brain(page),
+                    },
+                )
                 continue
 
             self._apply_vlm_success_to_page(
@@ -1538,8 +1887,27 @@ class ComicAgent:
                 batch_range=batch_range,
                 batch_id=batch_id,
             )
+            self._write_page_skill_artifact(
+                job,
+                skill_name="vlm_page_translate",
+                page_index=page.page_index,
+                filename="result.json",
+                data={
+                    "batch_id": batch_id,
+                    "batch_range": batch_range,
+                    "page_result": page_result,
+                    "batch_metrics": batch_metrics,
+                    "page_summary": self._build_page_summary_for_brain(page),
+                },
+            )
 
-    def _evaluate_vlm_page_quality(self, job: JobState, page: PageState, *, target_language: str) -> tuple[bool, Optional[str], list[str]]:
+    def _evaluate_vlm_page_quality(
+        self,
+        job: JobState,
+        page: PageState,
+        *,
+        target_language: str,
+    ) -> tuple[Dict[str, Any], bool, Optional[str], list[str]]:
         """Heuristic quality gate for VLM results.
 
         Goals:
@@ -1549,110 +1917,18 @@ class ComicAgent:
 
         warnings: list[str] = []
         regions = list(page.regions.values())
-        n = len(regions)
+        detector_found_text: Optional[bool] = None
 
         if getattr(page, "page_type", "content") in {"cover", "info"}:
-            return True, None, warnings
+            qa_report = evaluate_vlm_page(
+                page_type=page.page_type,
+                regions=[],
+                target_language=target_language,
+                image_size=page.vlm_orig_size,
+            )
+            return qa_report, True, None, warnings
 
-        def _bbox_iou(a: list[int], b: list[int]) -> float:
-            ax, ay, aw, ah = a
-            bx, by, bw, bh = b
-            ax2, ay2 = ax + aw, ay + ah
-            bx2, by2 = bx + bw, by + bh
-            ix1 = max(ax, bx)
-            iy1 = max(ay, by)
-            ix2 = min(ax2, bx2)
-            iy2 = min(ay2, by2)
-            iw = max(0, ix2 - ix1)
-            ih = max(0, iy2 - iy1)
-            inter = iw * ih
-            if inter <= 0:
-                return 0.0
-            union = (aw * ah) + (bw * bh) - inter
-            if union <= 0:
-                return 0.0
-            return inter / float(union)
-
-        def _bbox_quality_signals() -> tuple[list[str], Optional[str]]:
-            size = page.vlm_orig_size or []
-            if not (isinstance(size, list) and len(size) == 2 and all(isinstance(x, int) and x > 0 for x in size)):
-                return [], None
-
-            page_w, page_h = int(size[0]), int(size[1])
-            page_area = float(page_w * page_h)
-            boxed_infos: list[dict[str, Any]] = []
-            suspicious_messages: list[str] = []
-            hard_fail = False
-
-            for region in regions:
-                bbox = region.bbox
-                if not (isinstance(bbox, list) and len(bbox) == 4):
-                    continue
-                try:
-                    x, y, w, h = [int(round(float(v))) for v in bbox]
-                except Exception:
-                    continue
-                if w <= 0 or h <= 0:
-                    continue
-                area = float(w * h)
-                area_ratio = area / page_area if page_area > 0 else 0.0
-                src = str(region.ocr_text or "").strip()
-                tgt = str(region.translated_text or "").strip()
-                char_count = max(len(src), len(tgt))
-                chars_per_10k = (char_count * 10000.0 / area) if area > 0 else 0.0
-                boxed = region.has_text_box is not False
-
-                if boxed:
-                    boxed_infos.append(
-                        {
-                            "region_id": region.region_id,
-                            "bbox": [x, y, w, h],
-                            "area_ratio": area_ratio,
-                            "char_count": char_count,
-                            "chars_per_10k": chars_per_10k,
-                        }
-                    )
-
-                    if area_ratio >= 0.05 and char_count <= 80 and chars_per_10k < 3.0:
-                        suspicious_messages.append(
-                            f"r{region.region_id} boxed bbox is too large for its text (area={area_ratio:.3f}, chars={char_count}, density={chars_per_10k:.2f}/10k)."
-                        )
-                        hard_fail = True
-                    elif area_ratio >= 0.035 and char_count <= 48 and chars_per_10k < 2.2:
-                        suspicious_messages.append(
-                            f"r{region.region_id} boxed bbox looks loose (area={area_ratio:.3f}, chars={char_count}, density={chars_per_10k:.2f}/10k)."
-                        )
-
-            for idx in range(len(boxed_infos)):
-                for jdx in range(idx + 1, len(boxed_infos)):
-                    a = boxed_infos[idx]
-                    b = boxed_infos[jdx]
-                    iou = _bbox_iou(a["bbox"], b["bbox"])
-                    if iou < 0.55:
-                        continue
-                    if (
-                        a["area_ratio"] >= 0.04
-                        and b["area_ratio"] >= 0.04
-                        and a["chars_per_10k"] < 4.0
-                        and b["chars_per_10k"] < 4.0
-                    ):
-                        suspicious_messages.append(
-                            f"r{a['region_id']} and r{b['region_id']} have highly-overlapping oversized boxed bboxes (IoU={iou:.2f})."
-                        )
-                        hard_fail = True
-
-            return suspicious_messages, ("suspicious_bbox_geometry" if hard_fail else None)
-
-        def _has_cjk(s: str) -> bool:
-            for ch in s:
-                code = ord(ch)
-                if 0x4E00 <= code <= 0x9FFF:
-                    return True
-            return False
-
-        if n == 0:
-            # If VLM returns 0 regions, validate with local detector when possible.
-            # If detector sees text, treat VLM as suspicious.
+        if len(regions) == 0:
             try:
                 if page.image_ref:
                     from pathlib import Path
@@ -1660,48 +1936,39 @@ class ComicAgent:
                     p = Path(page.image_ref)
                     if p.exists() and p.is_file():
                         det = self.tools.run_detection(page)
-                        if det.get("ok") and (len(det.get("regions") or []) > 0):
-                            return False, "vlm_zero_regions_but_detector_found_text", ["VLM returned 0 regions but detector found text regions."]
+                        if det.get("ok"):
+                            detector_found_text = len(det.get("regions") or []) > 0
             except Exception:
-                # If detector validation fails, do not fail the page purely for that.
                 warnings.append("Detector validation skipped/failed for 0-region VLM output.")
 
-            # Could be a full-art / no-text page.
-            return True, None, warnings
+        qa_regions = [
+            {
+                "region_id": r.region_id,
+                "bbox": r.bbox,
+                "has_text_box": r.has_text_box,
+                "src_text": r.ocr_text or "",
+                "tgt_text": r.translated_text or "",
+            }
+            for r in regions
+        ]
+        qa_report = evaluate_vlm_page(
+            page_type=page.page_type,
+            regions=qa_regions,
+            target_language=target_language,
+            image_size=page.vlm_orig_size,
+            detector_found_text=detector_found_text,
+            extra_warnings=warnings,
+        )
 
-        bbox_warnings, bbox_reason = _bbox_quality_signals()
-        if bbox_warnings:
-            warnings.extend(bbox_warnings)
-        if bbox_reason is not None:
-            return False, bbox_reason, warnings
+        issues = [x for x in (qa_report.get("issues") or []) if isinstance(x, dict)]
+        reason = None
+        if issues:
+            reason = str(issues[0].get("code") or "").strip() or None
 
-        src_nonempty = 0
-        tgt_nonempty = 0
-        tgt_cjk = 0
-
-        for r in regions:
-            src = (r.ocr_text or "").strip()
-            tgt = (r.translated_text or "").strip()
-            if src:
-                src_nonempty += 1
-            if tgt:
-                tgt_nonempty += 1
-            if tgt and _has_cjk(tgt):
-                tgt_cjk += 1
-
-        # Extremely permissive thresholds to avoid expensive retries.
-        if n >= 3 and (src_nonempty / n) < 0.34:
-            return False, "too_many_empty_src_text", [f"Only {src_nonempty}/{n} regions have non-empty src_text."]
-
-        if n >= 3 and (tgt_nonempty / n) < 0.34:
-            return False, "too_many_empty_tgt_text", [f"Only {tgt_nonempty}/{n} regions have non-empty tgt_text."]
-
-        if target_language == "zh" and tgt_nonempty >= 3:
-            cjk_ratio = tgt_cjk / float(tgt_nonempty)
-            if cjk_ratio < 0.34:
-                return False, "target_language_mismatch", [f"Low CJK ratio in tgt_text: {tgt_cjk}/{tgt_nonempty}."]
-
-        return True, None, warnings
+        warning_messages = list((qa_report.get("metrics") or {}).get("warnings") or [])
+        warning_messages.extend(str(item.get("message") or "").strip() for item in issues if str(item.get("message") or "").strip())
+        warning_messages = list(dict.fromkeys([x for x in warning_messages if x]))
+        return qa_report, qa_report.get("status") == "good", reason, warning_messages
 
     def _do_ocr(self, job: JobState, page: PageState, retry: bool) -> None:
         page.stage = PageStage.OCRING
@@ -1777,12 +2044,50 @@ class ComicAgent:
         result = self.tools.run_erase(page, retry=retry, skill_params=skill_params)
 
         if not result["ok"]:
-            page.stage = PageStage.FAILED
-            page.page_error_message = "Erase failed."
+            error = _normalize_page_error(
+                result.get("error"),
+                stage="erase",
+                fallback_message="Erase failed.",
+            )
             page.erase_ok = False
+            page.erase_backend = str(((result.get("metrics") or {}).get("erase_backend")) or "") or None
+            page.erase_metrics = dict(result.get("metrics") or {})
+            if error.get("kind") == "remote_service":
+                page.erase_metrics["service_error"] = dict(error)
+            page.stage = PageStage.FAILED
+            page.page_error_message = _human_page_error_message(error, default_message="Erase failed.")
+            page.page_error_stage = "erase"
+            page.page_error_code = str(error.get("code") or "erase_failed")
+            page.page_error_details = error
+            page.qa_reports["erase"] = evaluate_erase_page(
+                page_type=page.page_type,
+                metrics=page.erase_metrics,
+                results=None,
+                expected_region_count=len(page.regions),
+            )
+            if error.get("kind") == "remote_service" or "service" in str(error.get("code") or "").lower() or "timeout" in str(error.get("code") or "").lower():
+                self._append_experience(
+                    job,
+                    kind="failure_pattern",
+                    note=str(error.get("message") or "Remote erase service issue."),
+                    situation={
+                        "stage": "erase",
+                        "page_type": page.page_type,
+                        "error_code": page.page_error_code,
+                        "error_stage": "erase",
+                    },
+                    recommended_action="ask_user",
+                    skill_params=skill_params or {},
+                    tags=["erase", "remote_service"],
+                    confidence=0.7,
+                )
             if retry:
                 page.retry_count_erase += 1
-            self._log(job, f"Page {page.page_index}: erase failed.")
+            self._log(
+                job,
+                f"Page {page.page_index}: erase failed, code={page.page_error_code}, message={page.page_error_message}",
+            )
+            self._refresh_page_brain_strategy(job, page, trigger="erase_failed")
             return
 
         if retry:
@@ -1791,8 +2096,64 @@ class ComicAgent:
         page.erase_ok = True
         page.erase_backend = result.get("erase_backend")
         page.erase_metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else None
+        page.page_error_message = None
+        page.page_error_stage = None
+        page.page_error_code = None
+        page.page_error_details = None
+        erase_qa = evaluate_erase_page(
+            page_type=page.page_type,
+            metrics=page.erase_metrics,
+            results=result.get("results") if isinstance(result.get("results"), dict) else None,
+            expected_region_count=len(page.regions),
+        )
+        page.qa_reports["erase"] = erase_qa
+        if isinstance(page.erase_metrics, dict):
+            page.erase_metrics["qa"] = erase_qa
+        erase_issue_codes = [
+            str(item.get("code") or "").strip()
+            for item in (erase_qa.get("issues") or [])
+            if isinstance(item, dict) and str(item.get("code") or "").strip()
+        ]
+        if erase_qa.get("status") in {"retryable", "bad", "blocked"}:
+            self._append_experience(
+                job,
+                kind="failure_pattern",
+                note=f"Erase QA reported {erase_qa.get('status')} for this page.",
+                situation={
+                    "stage": "erase",
+                    "page_type": page.page_type,
+                    "error_code": page.page_error_code,
+                    "erase_backend": page.erase_backend,
+                    "mask_quality": ((page.erase_metrics or {}).get("mask_quality")),
+                    "qa_status": erase_qa.get("status"),
+                    "issue_codes": erase_issue_codes,
+                },
+                recommended_action=str((erase_qa.get("retry_hint") or {}).get("preferred_action") or "retry_erase"),
+                skill_params=skill_params or {},
+                tags=["erase", "qa"] + [code for code in erase_issue_codes[:3] if code],
+                confidence=0.68,
+            )
+        elif erase_qa.get("status") == "good" and page.erase_backend not in {"mock", None}:
+            self._append_experience(
+                job,
+                kind="successful_strategy",
+                note="Erase completed with good QA.",
+                situation={
+                    "stage": "erase",
+                    "page_type": page.page_type,
+                    "erase_backend": page.erase_backend,
+                    "mask_quality": ((page.erase_metrics or {}).get("mask_quality")),
+                    "qa_status": "good",
+                },
+                recommended_action="continue",
+                skill_params=skill_params or {},
+                tags=["erase", "success"],
+                confidence=0.55,
+            )
         page.stage = PageStage.ERASED
         page.rendered_image_ref = None
+        page.typeset_metrics = None
+        page.qa_reports.pop("typeset", None)
         self._log(job, f"Page {page.page_index}: erase done, backend={page.erase_backend}, params={skill_params or {}}")
         self._refresh_page_brain_strategy(job, page, trigger="after_erase")
 
@@ -1822,6 +2183,62 @@ class ComicAgent:
 
         page.lettering_ok = all_ok
         page.typeset_metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else None
+        if page.typeset_metrics:
+            page.qa_reports["typeset"] = page.typeset_metrics.get("qa") or {}
+        typeset_qa = page.qa_reports.get("typeset") if isinstance(page.qa_reports.get("typeset"), dict) else {}
+        typeset_issue_codes = [
+            str(item.get("code") or "").strip()
+            for item in (typeset_qa.get("issues") or [])
+            if isinstance(item, dict) and str(item.get("code") or "").strip()
+        ]
+        if typeset_qa.get("status") in {"retryable", "bad"}:
+            retry_hint = (typeset_qa.get("retry_hint") or {}) if isinstance(typeset_qa.get("retry_hint"), dict) else {}
+            retry_skill_params = retry_hint.get("skill_params") if isinstance(retry_hint.get("skill_params"), dict) else {}
+            self._append_experience(
+                job,
+                kind="failure_pattern",
+                note=f"Typeset QA reported {typeset_qa.get('status')} for this page.",
+                situation={
+                    "stage": "typeset",
+                    "page_type": page.page_type,
+                    "qa_status": typeset_qa.get("status"),
+                    "issue_codes": typeset_issue_codes,
+                    "lettering_ok": page.lettering_ok,
+                },
+                recommended_action=str(retry_hint.get("preferred_action") or "retry_typeset"),
+                skill_params={**(skill_params or {}), **retry_skill_params},
+                tags=["typeset", "qa"] + [code for code in typeset_issue_codes[:3] if code],
+                confidence=0.68,
+            )
+        elif typeset_qa.get("status") == "good" and page.lettering_ok:
+            render_modes = sorted(
+                {
+                    str(((result.get("results") or {}).get(region_id, {}) or {}).get("render_params", {}).get("render_mode") or "").strip()
+                    for region_id in (result.get("results") or {})
+                }
+            )
+            placement_sources = sorted(
+                {
+                    str(((result.get("results") or {}).get(region_id, {}) or {}).get("render_params", {}).get("placement_source") or "").strip()
+                    for region_id in (result.get("results") or {})
+                }
+            )
+            self._append_experience(
+                job,
+                kind="successful_strategy",
+                note="Typesetting completed with good QA.",
+                situation={
+                    "stage": "typeset",
+                    "page_type": page.page_type,
+                    "qa_status": "good",
+                    "render_modes": render_modes,
+                    "placement_sources": placement_sources,
+                },
+                recommended_action="continue",
+                skill_params=skill_params or {},
+                tags=["typeset", "success"],
+                confidence=0.55,
+            )
         page.stage = PageStage.TYPESETTING
 
         self._log(job, f"Page {page.page_index}: typesetting done, all_ok={all_ok}, params={skill_params or {}}")

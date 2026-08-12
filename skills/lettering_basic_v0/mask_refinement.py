@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -29,6 +29,34 @@ class MaskRefinementConfig:
     min_component_area_ratio: float = 0.0008
     max_component_area_ratio: float = 0.35
 
+    # Remote auto-detect constraint pass
+    auto_mask_box_expand_px: int = 12
+    auto_mask_embedded_box_expand_px: int = 28
+    auto_mask_min_component_area_px: int = 40
+    auto_mask_min_component_overlap_ratio: float = 0.15
+    auto_mask_min_component_overlap_px: int = 24
+    auto_mask_final_erode_px: int = 1
+
+    # Heatmap-constrained v2 pass.
+    # Use VLM bbox only to assign/clip heatmap seeds; do not rasterize bbox rectangles into the final mask.
+    heatmap_threshold: int = 1
+    heatmap_component_assign_expand_px: int = 8
+    heatmap_safe_expand_px: int = 3
+    heatmap_min_component_area_px: int = 12
+    heatmap_min_component_overlap_px: int = 8
+    heatmap_min_component_overlap_ratio: float = 0.02
+    heatmap_close_px: int = 2
+    heatmap_dilate_px: int = 0
+    heatmap_max_growth_ratio: float = 1.35
+
+    # DC-Nightwing tuned default:
+    # grow a heatmap seed inside the raw manga-cleaner envelope until residue is low
+    # without jumping straight to the full raw detect blob.
+    hybrid_seed_safe_expand_px: int = 5
+    hybrid_envelope_safe_expand_px: int = 40
+    hybrid_growth_iterations: int = 15
+    hybrid_growth_kernel_px: int = 3
+
 
 def safe_bbox_xywh(bbox: List[int], W: int, H: int) -> Optional[Tuple[int, int, int, int]]:
     if not isinstance(bbox, list) or len(bbox) != 4:
@@ -48,6 +76,24 @@ def safe_bbox_xywh(bbox: List[int], W: int, H: int) -> Optional[Tuple[int, int, 
     return (x, y, w, h)
 
 
+def safe_bbox_xyxy(bbox: List[int], W: int, H: int) -> Optional[Tuple[int, int, int, int]]:
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return None
+    try:
+        x0, y0, x1, y1 = [int(round(float(v))) for v in bbox]
+    except Exception:
+        return None
+
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    x0 = max(0, min(W - 1, x0))
+    y0 = max(0, min(H - 1, y0))
+    x1 = max(x0 + 1, min(W, x1))
+    y1 = max(y0 + 1, min(H, y1))
+    return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+
 def expand_bbox_xywh(xywh: Tuple[int, int, int, int], W: int, H: int, expand_px: int) -> Tuple[int, int, int, int]:
     x, y, w, h = xywh
     pad = max(0, int(expand_px))
@@ -59,6 +105,45 @@ def expand_bbox_xywh(xywh: Tuple[int, int, int, int], W: int, H: int, expand_px:
     x1 = min(W, x + w + pad)
     y1 = min(H, y + h + pad)
     return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+
+def resolve_region_bbox_xywh(
+    bbox: Any,
+    *,
+    W: int,
+    H: int,
+    guide_mask: Optional[np.ndarray] = None,
+    expand_px: int = 0,
+) -> Optional[Tuple[int, int, int, int]]:
+    candidates: List[Tuple[int, int, int, int]] = []
+    if isinstance(bbox, list) and len(bbox) == 4:
+        xywh = safe_bbox_xywh(bbox, W, H)
+        if xywh:
+            candidates.append(xywh)
+        xyxy = safe_bbox_xyxy(bbox, W, H)
+        if xyxy and xyxy not in candidates:
+            candidates.append(xyxy)
+
+    if not candidates:
+        return None
+    if len(candidates) == 1 or guide_mask is None or guide_mask.size == 0 or np.count_nonzero(guide_mask) == 0:
+        chosen = candidates[0]
+        return expand_bbox_xywh(chosen, W, H, expand_px) if expand_px > 0 else chosen
+
+    best = candidates[0]
+    best_score = float("-inf")
+    binary = (guide_mask > 0).astype(np.uint8)
+    for cand in candidates:
+        x, y, w, h = expand_bbox_xywh(cand, W, H, expand_px) if expand_px > 0 else cand
+        region = binary[y : y + h, x : x + w]
+        overlap = float(np.count_nonzero(region))
+        area = float(max(1, w * h))
+        score = overlap / np.sqrt(area)
+        if score > best_score:
+            best_score = score
+            best = (x, y, w, h)
+
+    return best
 
 
 def coerce_has_text_box(value: Any) -> Optional[bool]:
@@ -281,6 +366,527 @@ def _mask_overlay(pil_img: Image.Image, mask: np.ndarray) -> Image.Image:
     return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), mode="RGB")
 
 
+def _rect_overlap_xywh(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> int:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ax2 = ax + aw
+    ay2 = ay + ah
+    bx2 = bx + bw
+    by2 = by + bh
+    ix1 = max(ax, bx)
+    iy1 = max(ay, by)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0
+    return int((ix2 - ix1) * (iy2 - iy1))
+
+
+def constrain_remote_detect_mask(
+    detect_mask: np.ndarray,
+    regions: List[Dict[str, Any]],
+    *,
+    image_size: Tuple[int, int],
+    cfg: MaskRefinementConfig,
+) -> Dict[str, Any]:
+    import cv2
+
+    W, H = image_size
+    raw_mask = (detect_mask > 0).astype(np.uint8) * 255
+    if raw_mask.shape[:2] != (H, W):
+        raw_mask = cv2.resize(raw_mask, (W, H), interpolation=cv2.INTER_NEAREST)
+
+    if np.count_nonzero(raw_mask) == 0 or not regions:
+        return {
+            "mask": raw_mask,
+            "gate_mask": np.zeros((H, W), dtype=np.uint8),
+            "metrics": {
+                "constraint_applied": False,
+                "raw_mask_pixels": int(np.count_nonzero(raw_mask)),
+                "constrained_mask_pixels": int(np.count_nonzero(raw_mask)),
+                "raw_mask_coverage": round(_coverage(raw_mask), 6),
+                "constrained_mask_coverage": round(_coverage(raw_mask), 6),
+                "kept_components": 0,
+                "dropped_components": 0,
+                "boxed_gate_regions": 0,
+                "embedded_gate_regions": 0,
+            },
+        }
+
+    gate_mask = np.zeros((H, W), dtype=np.uint8)
+    boxed_gate_mask = np.zeros((H, W), dtype=np.uint8)
+    embedded_gate_mask = np.zeros((H, W), dtype=np.uint8)
+    gate_regions: List[Dict[str, Any]] = []
+    boxed_gate_regions = 0
+    embedded_gate_regions = 0
+
+    for region in regions:
+        bbox = region.get("bbox_xyxy") or region.get("bbox_xywh") or region.get("bbox")
+        boxed = coerce_has_text_box(region.get("has_text_box")) is not False
+        expand_px = cfg.auto_mask_box_expand_px if boxed else cfg.auto_mask_embedded_box_expand_px
+        xywh = resolve_region_bbox_xywh(bbox, W=W, H=H, guide_mask=raw_mask, expand_px=expand_px)
+        if not xywh:
+            continue
+
+        x, y, w, h = xywh
+        gate_mask[y : y + h, x : x + w] = 255
+        if boxed:
+            boxed_gate_mask[y : y + h, x : x + w] = 255
+            boxed_gate_regions += 1
+        else:
+            embedded_gate_mask[y : y + h, x : x + w] = 255
+            embedded_gate_regions += 1
+
+        gate_regions.append(
+            {
+                "region_id": region.get("region_id"),
+                "has_text_box": boxed,
+                "expanded_bbox_xywh": [x, y, w, h],
+                "expand_px": int(expand_px),
+            }
+        )
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((raw_mask > 0).astype(np.uint8), connectivity=8)
+    constrained_boxed = np.zeros_like(raw_mask)
+    constrained_embedded = np.zeros_like(raw_mask)
+    kept_components = 0
+    dropped_components = 0
+    component_metrics: List[Dict[str, Any]] = []
+
+    for label in range(1, num_labels):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        component = (labels[y : y + h, x : x + w] == label)
+        if area < max(1, int(cfg.auto_mask_min_component_area_px)):
+            dropped_components += 1
+            component_metrics.append({"label": label, "area": area, "kept": False, "reason": "small_component"})
+            continue
+
+        boxed_overlap = int(np.count_nonzero(component & (boxed_gate_mask[y : y + h, x : x + w] > 0)))
+        embedded_overlap = int(np.count_nonzero(component & (embedded_gate_mask[y : y + h, x : x + w] > 0)))
+        best_overlap = max(boxed_overlap, embedded_overlap)
+        overlap_ratio = float(best_overlap) / float(max(1, area))
+        keep = best_overlap >= int(cfg.auto_mask_min_component_overlap_px) or overlap_ratio >= float(
+            cfg.auto_mask_min_component_overlap_ratio
+        )
+
+        if not keep:
+            dropped_components += 1
+            component_metrics.append(
+                {
+                    "label": label,
+                    "area": area,
+                    "kept": False,
+                    "reason": "low_region_overlap",
+                    "best_overlap_px": best_overlap,
+                    "best_overlap_ratio": round(overlap_ratio, 6),
+                }
+            )
+            continue
+
+        target_gate = boxed_gate_mask if boxed_overlap >= embedded_overlap else embedded_gate_mask
+        clipped = component & (target_gate[y : y + h, x : x + w] > 0)
+        if not np.any(clipped):
+            dropped_components += 1
+            component_metrics.append(
+                {
+                    "label": label,
+                    "area": area,
+                    "kept": False,
+                    "reason": "empty_after_clipping",
+                    "best_overlap_px": best_overlap,
+                }
+            )
+            continue
+
+        if target_gate is boxed_gate_mask:
+            constrained_boxed[y : y + h, x : x + w][clipped] = 255
+            component_kind = "boxed"
+        else:
+            constrained_embedded[y : y + h, x : x + w][clipped] = 255
+            component_kind = "embedded"
+
+        kept_components += 1
+        component_metrics.append(
+            {
+                "label": label,
+                "area": area,
+                "kept": True,
+                "kind": component_kind,
+                "best_overlap_px": best_overlap,
+                "best_overlap_ratio": round(overlap_ratio, 6),
+            }
+        )
+
+    if cfg.auto_mask_final_erode_px > 0 and np.count_nonzero(constrained_boxed) > 0:
+        constrained_boxed = cv2.erode(
+            constrained_boxed,
+            _kernel(max(1, int(cfg.auto_mask_final_erode_px))),
+            iterations=1,
+        )
+
+    constrained = np.maximum(constrained_boxed, constrained_embedded)
+    constrained = (constrained > 0).astype(np.uint8) * 255
+
+    return {
+        "mask": constrained,
+        "gate_mask": gate_mask,
+        "boxed_gate_mask": boxed_gate_mask,
+        "embedded_gate_mask": embedded_gate_mask,
+        "metrics": {
+            "constraint_applied": True,
+            "raw_mask_pixels": int(np.count_nonzero(raw_mask)),
+            "constrained_mask_pixels": int(np.count_nonzero(constrained)),
+            "raw_mask_coverage": round(_coverage(raw_mask), 6),
+            "constrained_mask_coverage": round(_coverage(constrained), 6),
+            "kept_components": kept_components,
+            "dropped_components": dropped_components,
+            "boxed_gate_regions": int(boxed_gate_regions),
+            "embedded_gate_regions": int(embedded_gate_regions),
+            "auto_mask_box_expand_px": int(cfg.auto_mask_box_expand_px),
+            "auto_mask_embedded_box_expand_px": int(cfg.auto_mask_embedded_box_expand_px),
+            "auto_mask_min_component_area_px": int(cfg.auto_mask_min_component_area_px),
+            "auto_mask_min_component_overlap_ratio": float(cfg.auto_mask_min_component_overlap_ratio),
+            "auto_mask_min_component_overlap_px": int(cfg.auto_mask_min_component_overlap_px),
+            "auto_mask_final_erode_px": int(cfg.auto_mask_final_erode_px),
+            "gate_regions": gate_regions,
+            "component_metrics": component_metrics,
+        },
+    }
+
+
+def constrain_remote_detect_heatmap(
+    heatmap: np.ndarray,
+    regions: List[Dict[str, Any]],
+    *,
+    image_size: Tuple[int, int],
+    cfg: MaskRefinementConfig,
+) -> Dict[str, Any]:
+    import cv2
+
+    W, H = image_size
+    raw_heatmap = np.asarray(heatmap)
+    if raw_heatmap.ndim == 3:
+        raw_heatmap = raw_heatmap[..., 0]
+    raw_heatmap = raw_heatmap.astype(np.uint8)
+    if raw_heatmap.shape[:2] != (H, W):
+        raw_heatmap = cv2.resize(raw_heatmap, (W, H), interpolation=cv2.INTER_NEAREST)
+
+    seed_mask = (raw_heatmap >= max(0, int(cfg.heatmap_threshold))).astype(np.uint8) * 255
+    if np.count_nonzero(seed_mask) == 0 or not regions:
+        return {
+            "mask": seed_mask,
+            "seed_mask": seed_mask,
+            "metrics": {
+                "constraint_applied": False,
+                "raw_heatmap_pixels": int(np.count_nonzero(seed_mask)),
+                "constrained_mask_pixels": int(np.count_nonzero(seed_mask)),
+                "raw_heatmap_coverage": round(_coverage(seed_mask), 6),
+                "constrained_mask_coverage": round(_coverage(seed_mask), 6),
+                "total_components": 0,
+                "assigned_components": 0,
+                "dropped_components": 0,
+                "region_metrics": [],
+            },
+        }
+
+    region_specs: List[Dict[str, Any]] = []
+    region_seed_masks: Dict[int, np.ndarray] = {}
+
+    for idx, region in enumerate(regions, start=1):
+        bbox = region.get("bbox_xyxy") or region.get("bbox_xywh") or region.get("bbox")
+        boxed = coerce_has_text_box(region.get("has_text_box")) is not False
+        base_xywh = resolve_region_bbox_xywh(bbox, W=W, H=H, guide_mask=seed_mask, expand_px=0)
+        if not base_xywh:
+            continue
+
+        assign_expand_px = int(cfg.heatmap_component_assign_expand_px)
+        safe_expand_px = int(cfg.heatmap_safe_expand_px if boxed else max(cfg.heatmap_safe_expand_px + 2, cfg.embedded_box_expand_px))
+        assign_xywh = expand_bbox_xywh(base_xywh, W, H, assign_expand_px)
+        safe_xywh = expand_bbox_xywh(base_xywh, W, H, safe_expand_px)
+        region_id = int(region.get("region_id") or idx)
+
+        region_specs.append(
+            {
+                "region_id": region_id,
+                "has_text_box": boxed,
+                "base_xywh": base_xywh,
+                "assign_xywh": assign_xywh,
+                "safe_xywh": safe_xywh,
+            }
+        )
+        region_seed_masks[region_id] = np.zeros((H, W), dtype=np.uint8)
+
+    if not region_specs:
+        return {
+            "mask": np.zeros((H, W), dtype=np.uint8),
+            "seed_mask": seed_mask,
+            "metrics": {
+                "constraint_applied": False,
+                "raw_heatmap_pixels": int(np.count_nonzero(seed_mask)),
+                "constrained_mask_pixels": 0,
+                "raw_heatmap_coverage": round(_coverage(seed_mask), 6),
+                "constrained_mask_coverage": 0.0,
+                "total_components": 0,
+                "assigned_components": 0,
+                "dropped_components": 0,
+                "region_metrics": [],
+            },
+        }
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((seed_mask > 0).astype(np.uint8), connectivity=8)
+    total_components = max(0, num_labels - 1)
+    assigned_components = 0
+    dropped_components = 0
+    component_metrics: List[Dict[str, Any]] = []
+
+    for label in range(1, num_labels):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < max(1, int(cfg.heatmap_min_component_area_px)):
+            dropped_components += 1
+            component_metrics.append({"label": label, "area": area, "kept": False, "reason": "small_component"})
+            continue
+
+        component = (labels[y : y + h, x : x + w] == label)
+        best_spec: Optional[Dict[str, Any]] = None
+        best_overlap_px = 0
+        best_overlap_ratio = 0.0
+        for spec in region_specs:
+            ax, ay, aw, ah = spec["assign_xywh"]
+            ix0 = max(x, ax)
+            iy0 = max(y, ay)
+            ix1 = min(x + w, ax + aw)
+            iy1 = min(y + h, ay + ah)
+            overlap_px = 0
+            if ix1 > ix0 and iy1 > iy0:
+                comp_crop = component[iy0 - y : iy1 - y, ix0 - x : ix1 - x]
+                overlap_px = int(np.count_nonzero(comp_crop))
+            overlap_ratio = float(overlap_px) / float(max(1, area))
+            if overlap_px > best_overlap_px or (overlap_px == best_overlap_px and overlap_ratio > best_overlap_ratio):
+                best_overlap_px = overlap_px
+                best_overlap_ratio = overlap_ratio
+                best_spec = spec
+
+        if (
+            best_spec is None
+            or (
+                best_overlap_px < int(cfg.heatmap_min_component_overlap_px)
+                and best_overlap_ratio < float(cfg.heatmap_min_component_overlap_ratio)
+            )
+        ):
+            dropped_components += 1
+            component_metrics.append(
+                {
+                    "label": label,
+                    "area": area,
+                    "kept": False,
+                    "reason": "low_region_overlap",
+                    "best_overlap_px": int(best_overlap_px),
+                    "best_overlap_ratio": round(best_overlap_ratio, 6),
+                }
+            )
+            continue
+
+        target = region_seed_masks[int(best_spec["region_id"])]
+        target[y : y + h, x : x + w][component] = 255
+        assigned_components += 1
+        component_metrics.append(
+            {
+                "label": label,
+                "area": area,
+                "kept": True,
+                "region_id": int(best_spec["region_id"]),
+                "best_overlap_px": int(best_overlap_px),
+                "best_overlap_ratio": round(best_overlap_ratio, 6),
+            }
+        )
+
+    final_mask = np.zeros((H, W), dtype=np.uint8)
+    region_metrics: List[Dict[str, Any]] = []
+
+    for spec in region_specs:
+        region_id = int(spec["region_id"])
+        seed = region_seed_masks[region_id]
+        seed_pixels = int(np.count_nonzero(seed))
+        if seed_pixels == 0:
+            region_metrics.append(
+                {
+                    "region_id": region_id,
+                    "has_text_box": bool(spec["has_text_box"]),
+                    "seed_pixels": 0,
+                    "grown_pixels": 0,
+                    "growth_ratio": 0.0,
+                    "fallback_used": False,
+                    "assigned_component_count": 0,
+                    "base_bbox_xywh": list(spec["base_xywh"]),
+                    "assign_bbox_xywh": list(spec["assign_xywh"]),
+                    "safe_bbox_xywh": list(spec["safe_xywh"]),
+                }
+            )
+            continue
+
+        ys, xs = np.where(seed > 0)
+        seed_x0 = int(xs.min())
+        seed_y0 = int(ys.min())
+        seed_x1 = int(xs.max()) + 1
+        seed_y1 = int(ys.max()) + 1
+
+        sx, sy, sw, sh = spec["safe_xywh"]
+        process_x0 = max(0, min(seed_x0, sx))
+        process_y0 = max(0, min(seed_y0, sy))
+        process_x1 = min(W, max(seed_x1, sx + sw))
+        process_y1 = min(H, max(seed_y1, sy + sh))
+        ax = process_x0
+        ay = process_y0
+        aw = max(1, process_x1 - process_x0)
+        ah = max(1, process_y1 - process_y0)
+        roi = seed[ay : ay + ah, ax : ax + aw]
+        seed_local = (roi > 0).astype(np.uint8) * 255
+        grown = seed_local.copy()
+
+        if cfg.heatmap_close_px > 1 and np.count_nonzero(grown) > 0:
+            grown = cv2.morphologyEx(grown, cv2.MORPH_CLOSE, _kernel(int(cfg.heatmap_close_px)), iterations=1)
+        if cfg.heatmap_dilate_px > 0 and np.count_nonzero(grown) > 0:
+            grown = cv2.dilate(grown, _kernel(int(cfg.heatmap_dilate_px) + 1), iterations=1)
+
+        safe_mask_roi = np.zeros_like(grown)
+        rx0 = max(0, sx - ax)
+        ry0 = max(0, sy - ay)
+        rx1 = min(aw, sx + sw - ax)
+        ry1 = min(ah, sy + sh - ay)
+        safe_mask_roi[ry0:ry1, rx0:rx1] = 255
+
+        # Keep the original assigned heatmap components intact.
+        # Only constrain newly added pixels so VLM bbox controls component count,
+        # not the final mask silhouette.
+        added = ((grown > 0) & ~(seed_local > 0)).astype(np.uint8) * 255
+        added = ((added > 0) & (safe_mask_roi > 0)).astype(np.uint8) * 255
+        grown = np.maximum(seed_local, added)
+
+        grown_pixels = int(np.count_nonzero(grown))
+        growth_ratio = float(grown_pixels) / float(max(1, seed_pixels))
+        fallback_used = False
+        if growth_ratio > float(cfg.heatmap_max_growth_ratio):
+            fallback_used = True
+            grown = seed_local.copy()
+            grown_pixels = int(np.count_nonzero(grown))
+            growth_ratio = float(grown_pixels) / float(max(1, seed_pixels))
+
+        final_mask[ay : ay + ah, ax : ax + aw] = np.maximum(final_mask[ay : ay + ah, ax : ax + aw], grown)
+
+        assigned_component_count = sum(1 for item in component_metrics if item.get("region_id") == region_id and item.get("kept"))
+        region_metrics.append(
+            {
+                "region_id": region_id,
+                "has_text_box": bool(spec["has_text_box"]),
+                "seed_pixels": seed_pixels,
+                "grown_pixels": grown_pixels,
+                "growth_ratio": round(growth_ratio, 6),
+                "fallback_used": fallback_used,
+                "assigned_component_count": int(assigned_component_count),
+                "base_bbox_xywh": list(spec["base_xywh"]),
+                "assign_bbox_xywh": list(spec["assign_xywh"]),
+                "process_bbox_xywh": [ax, ay, aw, ah],
+                "safe_bbox_xywh": list(spec["safe_xywh"]),
+            }
+        )
+
+    final_mask = (final_mask > 0).astype(np.uint8) * 255
+    return {
+        "mask": final_mask,
+        "seed_mask": seed_mask,
+        "metrics": {
+            "constraint_applied": True,
+            "raw_heatmap_pixels": int(np.count_nonzero(seed_mask)),
+            "constrained_mask_pixels": int(np.count_nonzero(final_mask)),
+            "raw_heatmap_coverage": round(_coverage(seed_mask), 6),
+            "constrained_mask_coverage": round(_coverage(final_mask), 6),
+            "total_components": int(total_components),
+            "assigned_components": int(assigned_components),
+            "dropped_components": int(dropped_components),
+            "heatmap_threshold": int(cfg.heatmap_threshold),
+            "heatmap_component_assign_expand_px": int(cfg.heatmap_component_assign_expand_px),
+            "heatmap_safe_expand_px": int(cfg.heatmap_safe_expand_px),
+            "heatmap_min_component_area_px": int(cfg.heatmap_min_component_area_px),
+            "heatmap_min_component_overlap_px": int(cfg.heatmap_min_component_overlap_px),
+            "heatmap_min_component_overlap_ratio": float(cfg.heatmap_min_component_overlap_ratio),
+            "heatmap_close_px": int(cfg.heatmap_close_px),
+            "heatmap_dilate_px": int(cfg.heatmap_dilate_px),
+            "heatmap_max_growth_ratio": float(cfg.heatmap_max_growth_ratio),
+            "region_metrics": region_metrics,
+            "component_metrics": component_metrics,
+        },
+    }
+
+
+def build_hybrid_detect_mask(
+    detect_mask: np.ndarray,
+    heatmap: np.ndarray,
+    regions: List[Dict[str, Any]],
+    *,
+    image_size: Tuple[int, int],
+    cfg: MaskRefinementConfig,
+) -> Dict[str, Any]:
+    import cv2
+
+    seed_cfg = replace(
+        cfg,
+        heatmap_safe_expand_px=int(cfg.hybrid_seed_safe_expand_px),
+        heatmap_close_px=0,
+        heatmap_dilate_px=0,
+        heatmap_max_growth_ratio=max(float(cfg.heatmap_max_growth_ratio), 10.0),
+    )
+    envelope_cfg = replace(
+        cfg,
+        heatmap_safe_expand_px=int(cfg.hybrid_envelope_safe_expand_px),
+        heatmap_close_px=0,
+        heatmap_dilate_px=0,
+        heatmap_max_growth_ratio=max(float(cfg.heatmap_max_growth_ratio), 10.0),
+    )
+
+    seed_bundle = constrain_remote_detect_heatmap(heatmap, regions, image_size=image_size, cfg=seed_cfg)
+    envelope_bundle = constrain_remote_detect_heatmap(detect_mask, regions, image_size=image_size, cfg=envelope_cfg)
+
+    seed_mask = (seed_bundle["mask"] > 0).astype(np.uint8) * 255
+    envelope_mask = (envelope_bundle["mask"] > 0).astype(np.uint8) * 255
+    grown = seed_mask.copy()
+    iterations = max(0, int(cfg.hybrid_growth_iterations))
+    kernel = _kernel(max(1, int(cfg.hybrid_growth_kernel_px)))
+
+    for _ in range(iterations):
+        grown = cv2.dilate(grown, kernel, iterations=1)
+        grown = ((grown > 0) & (envelope_mask > 0)).astype(np.uint8) * 255
+
+    return {
+        "mask": grown,
+        "seed_mask": seed_mask,
+        "envelope_mask": envelope_mask,
+        "metrics": {
+            "mask_strategy": "manga_auto_hybrid",
+            "tuning_comment": "DC-Nightwing",
+            "hybrid_growth_iterations": iterations,
+            "hybrid_growth_kernel_px": int(cfg.hybrid_growth_kernel_px),
+            "hybrid_seed_safe_expand_px": int(cfg.hybrid_seed_safe_expand_px),
+            "hybrid_envelope_safe_expand_px": int(cfg.hybrid_envelope_safe_expand_px),
+            "seed_mask_pixels": int(np.count_nonzero(seed_mask)),
+            "envelope_mask_pixels": int(np.count_nonzero(envelope_mask)),
+            "mask_pixels": int(np.count_nonzero(grown)),
+            "seed_mask_coverage": round(_coverage(seed_mask), 6),
+            "envelope_mask_coverage": round(_coverage(envelope_mask), 6),
+            "mask_coverage": round(_coverage(grown), 6),
+            "seed_metrics": seed_bundle.get("metrics") or {},
+            "envelope_metrics": envelope_bundle.get("metrics") or {},
+        },
+    }
+
+
 def build_page_mask(
     pil_img: Image.Image,
     regions: List[Dict[str, Any]],
@@ -296,8 +902,8 @@ def build_page_mask(
     embedded_regions = 0
 
     for r in regions:
-        bbox = r.get("bbox_xywh") or r.get("bbox")
-        xywh = safe_bbox_xywh(bbox, W, H)
+        bbox = r.get("bbox_xyxy") or r.get("bbox_xywh") or r.get("bbox")
+        xywh = resolve_region_bbox_xywh(bbox, W=W, H=H)
         if not xywh:
             continue
 

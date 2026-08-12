@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .job_io import resolve_job_dir_from_path
+
 
 def utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -24,6 +26,7 @@ class LocalMemoryStore:
         "style_memory": "style_memory.json",
         "project_memory": "project_memory.json",
         "brain_memory": "brain_memory.json",
+        "experience_memory": "experience_memory.json",
     }
     rag_bundle_buckets = ("glossary", "translation_memory", "style_memory", "project_memory")
 
@@ -39,10 +42,9 @@ class LocalMemoryStore:
             p = Path(image_ref)
             if not p.is_absolute() and p.parent == Path("."):
                 continue
-            if p.parent.name in {"pages", "erased", "rendered", "masks"}:
-                return p.parent.parent
-            if p.parent != Path("."):
-                return p.parent
+            resolved = resolve_job_dir_from_path(p)
+            if resolved != Path("."):
+                return resolved
 
         return Path("data/jobs") / str(job.job_id)
 
@@ -127,6 +129,15 @@ class LocalMemoryStore:
             str(entry.get("src_text") or "").strip(),
             str(entry.get("tgt_text") or "").strip(),
             str(entry.get("scope") or "project"),
+        )
+
+    def _experience_identity(self, entry: Dict[str, Any]) -> tuple[str, str, str, str]:
+        situation = entry.get("situation") if isinstance(entry.get("situation"), dict) else {}
+        return (
+            str(entry.get("kind") or ""),
+            json.dumps(situation, ensure_ascii=False, sort_keys=True),
+            str(entry.get("tgt_text") or "").strip(),
+            str(entry.get("recommended_action") or "").strip(),
         )
 
     def upsert_entries(self, job, bucket: str, entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -228,6 +239,93 @@ class LocalMemoryStore:
             entries = entries[-keep_last:]
         data["entries"] = entries
         self.save_bucket(job, "brain_memory", data)
+        return entry
+
+    def append_experience_event(
+        self,
+        job,
+        *,
+        kind: str,
+        note: str,
+        situation: Optional[Dict[str, Any]] = None,
+        recommended_action: Optional[str] = None,
+        skill_params: Optional[Dict[str, Any]] = None,
+        tags: Optional[List[str]] = None,
+        confidence: Optional[float] = None,
+        keep_last: int = 160,
+    ) -> Dict[str, Any]:
+        self.ensure_initialized(job)
+        data = self.load_bucket(job, "experience_memory")
+        entries = [x for x in data.get("entries", []) if isinstance(x, dict)]
+        now = utc_iso()
+        entry: Dict[str, Any] = {
+            "entry_id": str(uuid.uuid4()),
+            "kind": str(kind or "runtime_observation"),
+            "src_text": json.dumps(situation or {}, ensure_ascii=False, sort_keys=True),
+            "tgt_text": str(note or "").strip(),
+            "scope": "project",
+            "source": "runtime_observation",
+            "updated_at": now,
+            "situation": dict(situation or {}),
+            "recommended_action": str(recommended_action or "").strip() or None,
+            "skill_params": dict(skill_params or {}),
+            "tags": [str(x).strip() for x in (tags or []) if str(x).strip()],
+            "confidence": confidence,
+            "first_seen_at": now,
+            "last_seen_at": now,
+            "repeat_count": 1,
+        }
+
+        new_identity = self._experience_identity(entry)
+        matched_idx: Optional[int] = None
+        for idx in range(len(entries) - 1, -1, -1):
+            if self._experience_identity(entries[idx]) == new_identity:
+                matched_idx = idx
+                break
+
+        if matched_idx is not None:
+            existing = dict(entries[matched_idx])
+            merged_tags = sorted(
+                {
+                    str(x).strip()
+                    for x in list(existing.get("tags") or []) + list(entry.get("tags") or [])
+                    if str(x).strip()
+                }
+            )
+            merged_skill_params = dict(existing.get("skill_params") or {})
+            merged_skill_params.update(entry.get("skill_params") or {})
+            old_conf = existing.get("confidence")
+            try:
+                old_conf_val = float(old_conf) if old_conf is not None else None
+            except Exception:
+                old_conf_val = None
+            try:
+                new_conf_val = float(confidence) if confidence is not None else None
+            except Exception:
+                new_conf_val = None
+
+            existing.update(
+                {
+                    "updated_at": now,
+                    "last_seen_at": now,
+                    "repeat_count": int(existing.get("repeat_count") or 1) + 1,
+                    "tags": merged_tags,
+                    "skill_params": merged_skill_params,
+                    "confidence": max(x for x in [old_conf_val, new_conf_val] if x is not None)
+                    if old_conf_val is not None or new_conf_val is not None
+                    else None,
+                }
+            )
+            existing.setdefault("first_seen_at", existing.get("updated_at") or now)
+            entries[matched_idx] = existing
+            entry = existing
+        else:
+            entries.append(entry)
+
+        if keep_last > 0:
+            entries = entries[-keep_last:]
+        data["entries"] = entries
+        self.save_bucket(job, "experience_memory", data)
         return entry
 
     def snapshot(self, job) -> Dict[str, Any]:

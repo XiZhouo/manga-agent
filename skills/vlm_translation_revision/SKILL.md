@@ -32,7 +32,7 @@ Required fields:
     - `page_type`
     - `regions`
       - `region_id`
-      - `bbox_xywh`
+      - `bbox_xyxy`
       - `has_text_box`
       - `color`
       - `src_text`
@@ -79,7 +79,7 @@ Other important fields:
 Notes:
 
 - The skill should preserve passthrough metadata like `page_type`, `has_text_box`, and `color`.
-- The skill must not mutate `region_id` or `bbox_xywh`.
+- The skill must not mutate `region_id` or `bbox_xyxy`.
 - The skill only patches `tgt_text`.
 - The returned `document_range` should match the input window so downstream stages know which page bundle was revised.
 

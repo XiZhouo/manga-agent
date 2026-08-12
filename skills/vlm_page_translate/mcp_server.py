@@ -21,8 +21,11 @@ def translate_page(
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
     temperature: float = 0.0,
     max_width: int = 0,
-    max_height: int = 3057,
+    max_height: int = 0,
     max_long_side: int = 0,
+    enable_thinking: bool = True,
+    thinking_budget: Optional[int] = 81920,
+    vl_high_resolution_images: bool = True,
     timeout_seconds: Optional[float] = None,
 ):
     """MCP tool: VLM core (detect+OCR+translate) for a single manga page."""
@@ -34,6 +37,9 @@ def translate_page(
         max_width=max_width,
         max_height=max_height,
         max_long_side=max_long_side,
+        enable_thinking=enable_thinking,
+        thinking_budget=thinking_budget,
+        vl_high_resolution_images=vl_high_resolution_images,
         timeout_seconds=timeout_seconds,
     )
 
@@ -58,8 +64,11 @@ def translate_page_batch(
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
     temperature: float = 0.0,
     max_width: int = 0,
-    max_height: int = 3057,
+    max_height: int = 0,
     max_long_side: int = 0,
+    enable_thinking: bool = True,
+    thinking_budget: Optional[int] = 81920,
+    vl_high_resolution_images: bool = True,
     timeout_seconds: Optional[float] = None,
 ):
     """MCP tool: VLM core (detect+OCR+translate) for a small page batch."""
@@ -71,6 +80,9 @@ def translate_page_batch(
         max_width=max_width,
         max_height=max_height,
         max_long_side=max_long_side,
+        enable_thinking=enable_thinking,
+        thinking_budget=thinking_budget,
+        vl_high_resolution_images=vl_high_resolution_images,
         timeout_seconds=timeout_seconds,
     )
 

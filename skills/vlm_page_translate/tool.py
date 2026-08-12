@@ -19,8 +19,11 @@ def vlm_page_translate(
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
     temperature: float = 0.0,
     max_width: int = 0,
-    max_height: int = 3057,
+    max_height: int = 0,
     max_long_side: int = 0,
+    enable_thinking: bool = True,
+    thinking_budget: Optional[int] = 81920,
+    vl_high_resolution_images: bool = True,
     timeout_seconds: Optional[float] = None,
 ) -> dict:
     """Detect + OCR + translate a manga page using a multimodal VLM (OpenAI-compatible).
@@ -39,6 +42,9 @@ def vlm_page_translate(
         max_width=max_width,
         max_height=max_height,
         max_long_side=max_long_side,
+        enable_thinking=enable_thinking,
+        thinking_budget=thinking_budget,
+        vl_high_resolution_images=vl_high_resolution_images,
         timeout_seconds=timeout_seconds,
     )
 
@@ -63,8 +69,11 @@ def vlm_page_translate_batch(
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
     temperature: float = 0.0,
     max_width: int = 0,
-    max_height: int = 3057,
+    max_height: int = 0,
     max_long_side: int = 0,
+    enable_thinking: bool = True,
+    thinking_budget: Optional[int] = 81920,
+    vl_high_resolution_images: bool = True,
     timeout_seconds: Optional[float] = None,
 ) -> dict:
     """Detect + OCR + translate a small page window using one multimodal VLM call.
@@ -82,6 +91,9 @@ def vlm_page_translate_batch(
         max_width=max_width,
         max_height=max_height,
         max_long_side=max_long_side,
+        enable_thinking=enable_thinking,
+        thinking_budget=thinking_budget,
+        vl_high_resolution_images=vl_high_resolution_images,
         timeout_seconds=timeout_seconds,
     )
 

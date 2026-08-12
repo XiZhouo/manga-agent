@@ -6,6 +6,9 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from .brain_contracts import BrainIntent, BrainPlan, ResponseStyle
+from .file_resolver import extract_path_candidates
+
 # NOTE: LangChain dependencies are optional for offline/stub runs.
 # We import them lazily only when the brain is actually invoked.
 
@@ -60,6 +63,174 @@ def _extract_page_number_heuristic(msg: str) -> Optional[int]:
     return None
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _merge_skill_param_suggestions(target: Dict[str, Dict[str, Any]], source: Dict[str, Any]) -> None:
+    _merge_skill_param_suggestions_mode(target, source, overwrite_existing=False)
+
+
+def _merge_skill_param_suggestions_mode(
+    target: Dict[str, Dict[str, Any]],
+    source: Dict[str, Any],
+    *,
+    overwrite_existing: bool,
+) -> None:
+    if not isinstance(source, dict):
+        return
+    for skill_name, params in source.items():
+        if not isinstance(params, dict):
+            continue
+        bucket = target.setdefault(str(skill_name), {})
+        if not isinstance(bucket, dict):
+            bucket = {}
+            target[str(skill_name)] = bucket
+        for key, value in params.items():
+            if overwrite_existing:
+                bucket[str(key)] = value
+            else:
+                bucket.setdefault(str(key), value)
+
+
+def _apply_proactive_success_params(
+    *,
+    page_summary: Dict[str, Any],
+    strategy: Dict[str, Any],
+    params: Dict[str, Dict[str, Any]],
+    summary_parts: list[str],
+    memory_context: Optional[Dict[str, Any]],
+) -> None:
+    if not isinstance(memory_context, dict):
+        return
+
+    proactive = memory_context.get("proactive_success_params") if isinstance(memory_context.get("proactive_success_params"), dict) else {}
+    suggested = proactive.get("skill_param_suggestions") if isinstance(proactive.get("skill_param_suggestions"), dict) else {}
+    if not suggested:
+        return
+
+    stage = str(page_summary.get("stage") or "").strip().lower()
+    current_action = str(strategy.get("recommended_page_action") or "").strip().lower()
+    failure_like = current_action in {"retry_erase", "retry_typeset", "retry_vlm_page", "retry_translation", "ask_user"} or stage == "failed"
+    _merge_skill_param_suggestions_mode(params, suggested, overwrite_existing=not failure_like)
+
+    matched_entries = proactive.get("matched_entries") if isinstance(proactive.get("matched_entries"), list) else []
+    if matched_entries:
+        skill_list = ", ".join(str(item.get("skill_name") or "").strip() for item in matched_entries[:3] if str(item.get("skill_name") or "").strip())
+        if skill_list:
+            summary_parts.append(f"reuse successful strategy params for {skill_list}")
+
+
+def _apply_experience_policy_to_page_strategy(
+    *,
+    page_summary: Dict[str, Any],
+    strategy: Dict[str, Any],
+    params: Dict[str, Dict[str, Any]],
+    summary_parts: list[str],
+    memory_context: Optional[Dict[str, Any]],
+) -> None:
+    if not isinstance(memory_context, dict):
+        return
+
+    policy = memory_context.get("experience_policy") if isinstance(memory_context.get("experience_policy"), dict) else {}
+    top_action = str(policy.get("top_action") or "").strip().lower()
+    top_score = _safe_float(policy.get("top_action_score"), 0.0)
+    suggested_params = policy.get("suggested_skill_params") if isinstance(policy.get("suggested_skill_params"), dict) else {}
+    policy_summary = str(policy.get("summary") or "").strip()
+    current_action = str(strategy.get("recommended_page_action") or "").strip().lower()
+    stage = str(page_summary.get("stage") or "").strip().lower()
+    page_error_stage = str(page_summary.get("page_error_stage") or "").strip().lower()
+    vlm_quality_ok = page_summary.get("vlm_quality_ok")
+    vlm_qa_status = str(page_summary.get("vlm_qa_status") or "").strip().lower()
+    erase_qa_status = str(page_summary.get("erase_qa_status") or "").strip().lower()
+    erase_mask_quality = str(page_summary.get("erase_mask_quality") or "").strip().lower()
+    typeset_qa_status = str(page_summary.get("typeset_qa_status") or "").strip().lower()
+    embedded_ratio = _safe_float(page_summary.get("embedded_ratio"), 0.0)
+    overflow_regions = int(page_summary.get("overflow_regions") or 0)
+    bad_render_regions = int(page_summary.get("bad_render_regions") or 0)
+    empty_tgt_regions = int(page_summary.get("empty_tgt_regions") or 0)
+
+    if not top_action:
+        return
+
+    if current_action and top_action == current_action:
+        _merge_skill_param_suggestions(params, suggested_params)
+        summary_parts.append(f"experience memory supports {top_action}")
+        if policy_summary:
+            summary_parts.append(policy_summary)
+        return
+
+    if current_action == "retry_typeset" and top_action == "retry_erase":
+        erase_signals = (
+            erase_qa_status in {"retryable", "bad", "blocked"}
+            or erase_mask_quality in {"under_masked", "over_masked"}
+            or embedded_ratio >= 0.5
+            or stage in {"erased"}
+            or page_error_stage == "erase"
+        )
+        if erase_signals and top_score >= 3.0:
+            strategy["recommended_page_action"] = "retry_erase"
+            strategy["preferred_rerun_action"] = "retry_erase"
+            _merge_skill_param_suggestions(params, suggested_params)
+            summary_parts.append("experience memory shifts retry from typeset to erase")
+            if policy_summary:
+                summary_parts.append(policy_summary)
+            return
+
+    action_has_local_signal = False
+    if top_action == "retry_erase":
+        action_has_local_signal = (
+            stage in {"erased", "typesetting", "failed"}
+            and (
+                page_error_stage == "erase"
+                or erase_qa_status in {"retryable", "bad", "blocked"}
+                or erase_mask_quality in {"under_masked", "over_masked"}
+            )
+        )
+    elif top_action == "retry_typeset":
+        action_has_local_signal = (
+            stage in {"typesetting", "failed", "done"}
+            and (
+                page_error_stage == "typeset"
+                or typeset_qa_status in {"retryable", "bad"}
+                or overflow_regions > 0
+                or bad_render_regions > 0
+            )
+        )
+    elif top_action == "retry_vlm_page":
+        action_has_local_signal = (
+            stage in {"translated", "failed"}
+            and (
+                page_error_stage == "vlm"
+                or vlm_qa_status in {"retryable", "bad"}
+                or vlm_quality_ok is False
+                or empty_tgt_regions > 0
+            )
+        )
+    elif top_action in {"retry_translation", "run_revision"}:
+        action_has_local_signal = stage == "translated" and (empty_tgt_regions > 0 or vlm_quality_ok is False)
+
+    if not current_action and top_action != "ask_user" and action_has_local_signal and top_score >= 2.8:
+        strategy["recommended_page_action"] = top_action
+        if top_action in {"retry_erase", "retry_typeset", "retry_vlm_page", "retry_translation"}:
+            strategy["preferred_rerun_action"] = top_action
+        _merge_skill_param_suggestions(params, suggested_params)
+        summary_parts.append(f"experience memory suggests {top_action}")
+        if policy_summary:
+            summary_parts.append(policy_summary)
+        return
+
+    if top_action == "ask_user" and not current_action and top_score >= 3.5 and (stage == "failed" or page_error_stage):
+        strategy["recommended_page_action"] = "ask_user"
+        strategy.setdefault("ask_user_reason", "Similar prior failures usually required user intervention.")
+        summary_parts.append("experience memory suggests user intervention")
+        if policy_summary:
+            summary_parts.append(policy_summary)
+
+
 class DecisionBrain:
     """LLM-based agent brain.
 
@@ -79,6 +250,7 @@ class DecisionBrain:
         job_summary: Dict[str, Any],
         pipeline_mode: str,
         target_language: str,
+        memory_context: Optional[Dict[str, Any]] = None,
         skill_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Return proactive job-level strategy suggestions.
@@ -134,6 +306,7 @@ class DecisionBrain:
             content=(
                 "You are the job-strategy brain of a comic translation agent. "
                 "You receive a structured job_summary with queue state and page-stage counts. "
+                "You may also receive memory_context with recent job memory and project rules; use it only when relevant. "
                 "Recommend SAFE, minimal job-level strategy updates. "
                 "Focus on queueing and VLM batching, not page-local typography decisions. "
                 "If VLM mode is active, prefer grouping the next contiguous pages into one small batch window rather than sending the whole book. "
@@ -148,6 +321,7 @@ class DecisionBrain:
                 "pipeline_mode": pipeline_mode,
                 "target_language": target_language,
             },
+            "memory_context": memory_context or {},
             "skill_context": skill_context or {},
             "output_schema": {
                 "strategy_suggestions": {
@@ -203,6 +377,7 @@ class DecisionBrain:
         page_summary: Dict[str, Any],
         pipeline_mode: str,
         target_language: str,
+        memory_context: Optional[Dict[str, Any]] = None,
         skill_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Return proactive page-level strategy suggestions.
@@ -214,15 +389,29 @@ class DecisionBrain:
         def _heuristic() -> Dict[str, Any]:
             stage = str(page_summary.get("stage") or "").strip().lower()
             page_type = str(page_summary.get("page_type") or "content").strip().lower()
+            page_error_stage = str(page_summary.get("page_error_stage") or "").strip().lower()
+            page_error_code = str(page_summary.get("page_error_code") or "").strip().lower()
+            page_error_message = str(page_summary.get("page_error_message") or "").strip()
             embedded_ratio = float(page_summary.get("embedded_ratio") or 0.0)
             empty_tgt_regions = int(page_summary.get("empty_tgt_regions") or 0)
             overflow_regions = int(page_summary.get("overflow_regions") or 0)
             bad_render_regions = int(page_summary.get("bad_render_regions") or 0)
             has_erased_image = bool(page_summary.get("has_erased_image"))
             erase_backend = str(page_summary.get("erase_backend") or "").strip().lower()
+            vlm_qa_status = str(page_summary.get("vlm_qa_status") or "").strip().lower()
+            vlm_qa_retry_hint = page_summary.get("vlm_qa_retry_hint") or {}
+            vlm_qa_issue_count = int(page_summary.get("vlm_qa_issue_count") or 0)
+            erase_qa_status = str(page_summary.get("erase_qa_status") or "").strip().lower()
+            erase_qa_retry_hint = page_summary.get("erase_qa_retry_hint") or {}
+            erase_qa_issue_count = int(page_summary.get("erase_qa_issue_count") or 0)
             erase_mask_quality = str(page_summary.get("erase_mask_quality") or "").strip().lower()
             erase_mask_reason = str(page_summary.get("erase_mask_quality_reason") or "").strip()
             erase_mask_retry_hint = page_summary.get("erase_mask_retry_hint") or {}
+            erase_service_error = page_summary.get("erase_service_error") or {}
+            erase_service_unavailable = bool(page_summary.get("erase_service_unavailable"))
+            typeset_qa_status = str(page_summary.get("typeset_qa_status") or "").strip().lower()
+            typeset_qa_retry_hint = page_summary.get("typeset_qa_retry_hint") or {}
+            typeset_qa_issue_count = int(page_summary.get("typeset_qa_issue_count") or 0)
             auto_revision_done = bool(page_summary.get("auto_revision_done"))
             vlm_quality_ok = page_summary.get("vlm_quality_ok")
             vlm_quality_reason = str(page_summary.get("vlm_quality_reason") or "").strip().lower()
@@ -252,6 +441,25 @@ class DecisionBrain:
                 strategy["page_profile"] = "boxed_dialogue"
                 summary_parts.append("boxed-dialogue page")
 
+            if (
+                erase_service_unavailable
+                or erase_service_error
+                or (stage == "failed" and page_error_stage == "erase" and ("service_unreachable" in page_error_code or "service_unavailable" in page_error_code or "timeout" in page_error_code))
+            ):
+                service_message = str((erase_service_error or {}).get("message") or page_error_message or "Remote erase service is unavailable or not responding.").strip()
+                strategy["recommended_page_action"] = "ask_user"
+                strategy["ask_user_reason"] = (
+                    "Remote erase service is unavailable. Please restart the Windows inpaint service and retry this page."
+                )
+                strategy["preferred_rerun_action"] = "retry_erase"
+                summary_parts.append(f"erase blocked by remote service: {service_message}")
+                return {
+                    "strategy_suggestions": strategy,
+                    "skill_param_suggestions": params,
+                    "summary": "; ".join(summary_parts),
+                    "confidence": 0.98,
+                }
+
             if stage == "translated":
                 if vlm_judge_decision == "ask_user":
                     strategy["recommended_page_action"] = "ask_user"
@@ -260,12 +468,24 @@ class DecisionBrain:
                 elif vlm_judge_decision == "retry":
                     strategy["recommended_page_action"] = "retry_vlm_page"
                     summary_parts.append("judge requested a VLM retry")
+                elif vlm_qa_status in {"retryable", "bad"}:
+                    strategy["recommended_page_action"] = "retry_vlm_page"
+                    if isinstance(vlm_qa_retry_hint, dict) and vlm_qa_retry_hint:
+                        params.setdefault("vlm_page_translate", {}).update(vlm_qa_retry_hint)
+                    summary_parts.append(
+                        "local VLM QA suggests retry"
+                        + (f" ({vlm_qa_issue_count} qa issues)" if vlm_qa_issue_count > 0 else "")
+                    )
                 elif vlm_quality_ok is False:
                     retriable = {
                         "vlm_request_failed",
                         "bad_json",
                         "target_language_mismatch",
                         "judge_retry",
+                        "zero_regions_but_detector_found_text",
+                        "bbox_too_large_for_text",
+                        "bbox_looks_loose",
+                        "overlapping_oversized_bboxes",
                     }
                     if vlm_quality_reason in retriable or vlm_quality_reason.startswith("vlm_zero_regions") or vlm_quality_reason.startswith("too_many_empty"):
                         strategy["recommended_page_action"] = "retry_vlm_page"
@@ -287,8 +507,21 @@ class DecisionBrain:
                     strategy["recommended_page_action"] = strategy.get("recommended_page_action") or "run_revision"
                     summary_parts.append("recommend revision before erase")
 
-            if stage == "typesetting" and (overflow_regions > 0 or bad_render_regions > 0):
-                if erase_mask_quality in {"under_masked", "over_masked"} and has_erased_image:
+            if stage == "typesetting" and (overflow_regions > 0 or bad_render_regions > 0 or typeset_qa_status in {"retryable", "bad"}):
+                if erase_qa_status in {"retryable", "bad"} and has_erased_image:
+                    strategy["recommended_page_action"] = "retry_erase"
+                    strategy["preferred_rerun_action"] = "retry_erase"
+                    params.setdefault("lama_eraser", {})
+                    if isinstance(erase_qa_retry_hint, dict):
+                        params["lama_eraser"].update(erase_qa_retry_hint)
+                    params.setdefault("lettering", {})
+                    params["lettering"].setdefault("render_mode", "art_embed" if embedded_ratio >= 0.5 else "bubble_fit")
+                    params["lettering"].setdefault("padding_ratio", 0.05 if embedded_ratio >= 0.5 else 0.04)
+                    summary_parts.append(
+                        "typeset issue likely rooted in erase QA"
+                        + (f" ({erase_qa_issue_count} qa issues)" if erase_qa_issue_count > 0 else "")
+                    )
+                elif erase_mask_quality in {"under_masked", "over_masked"} and has_erased_image:
                     strategy["recommended_page_action"] = "retry_erase"
                     strategy["preferred_rerun_action"] = "retry_erase"
                     params.setdefault("lama_eraser", {})
@@ -312,12 +545,27 @@ class DecisionBrain:
                     strategy["recommended_page_action"] = "retry_typeset"
                     strategy["preferred_rerun_action"] = "retry_typeset"
                     params.setdefault("lettering", {})
+                    if isinstance(typeset_qa_retry_hint, dict) and isinstance(typeset_qa_retry_hint.get("skill_params"), dict):
+                        params["lettering"].update(typeset_qa_retry_hint.get("skill_params") or {})
                     params["lettering"].setdefault("render_mode", "bubble_fit")
                     params["lettering"].setdefault("padding_ratio", 0.04)
                     params["lettering"].setdefault("line_spacing", 1.0)
-                    summary_parts.append("typeset issue looks layout-driven")
+                    summary_parts.append(
+                        "typeset issue looks layout-driven"
+                        + (f" ({typeset_qa_issue_count} qa issues)" if typeset_qa_issue_count > 0 else "")
+                    )
 
-            if stage == "erased" and erase_mask_quality in {"under_masked", "over_masked"} and has_erased_image:
+            if stage == "erased" and erase_qa_status in {"retryable", "bad"} and has_erased_image:
+                strategy["recommended_page_action"] = "retry_erase"
+                strategy["preferred_rerun_action"] = "retry_erase"
+                params.setdefault("lama_eraser", {})
+                if isinstance(erase_qa_retry_hint, dict):
+                    params["lama_eraser"].update(erase_qa_retry_hint)
+                summary_parts.append(
+                    "erase QA suggests retry"
+                    + (f" ({erase_qa_issue_count} qa issues)" if erase_qa_issue_count > 0 else "")
+                )
+            elif stage == "erased" and erase_mask_quality in {"under_masked", "over_masked"} and has_erased_image:
                 strategy["recommended_page_action"] = "retry_erase"
                 strategy["preferred_rerun_action"] = "retry_erase"
                 params.setdefault("lama_eraser", {})
@@ -327,6 +575,22 @@ class DecisionBrain:
 
             if stage == "erased" and erase_backend == "mock":
                 summary_parts.append("using mock erase backend")
+
+            _apply_proactive_success_params(
+                page_summary=page_summary,
+                strategy=strategy,
+                params=params,
+                summary_parts=summary_parts,
+                memory_context=memory_context,
+            )
+
+            _apply_experience_policy_to_page_strategy(
+                page_summary=page_summary,
+                strategy=strategy,
+                params=params,
+                summary_parts=summary_parts,
+                memory_context=memory_context,
+            )
 
             summary = "; ".join(summary_parts) if summary_parts else "default page strategy"
             return {
@@ -354,6 +618,7 @@ class DecisionBrain:
             content=(
                 "You are the page-strategy brain of a comic translation agent. "
                 "You receive a structured page_summary describing the current page state, quality signals, and recent execution outputs. "
+                "You may also receive memory_context with relevant technical memory and recent job memory; use it when it helps explain retry choices. "
                 "Recommend SAFE, minimal strategy updates for the next step. "
                 "Do not invent observations not present in page_summary. "
                 "Use page_profile to distinguish art-integrated pages from boxed-dialogue pages when strongly supported. "
@@ -371,6 +636,7 @@ class DecisionBrain:
                 "pipeline_mode": pipeline_mode,
                 "target_language": target_language,
             },
+            "memory_context": memory_context or {},
             "skill_context": skill_context or {},
             "output_schema": {
                 "strategy_suggestions": {
@@ -444,6 +710,222 @@ class DecisionBrain:
         if not out["strategy_suggestions"] and not out["skill_param_suggestions"] and not out["summary"]:
             return _heuristic()
         return out
+
+    def plan_chat_message(
+        self,
+        *,
+        user_message: str,
+        active_job_id: Optional[str] = None,
+        has_active_job: bool = False,
+        target_language: str = "zh",
+        pipeline_mode: str = "vlm",
+        brain_context: Optional[Dict[str, Any]] = None,
+        skill_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        text = str(user_message or "").strip()
+        lower = text.lower()
+        path_candidates = extract_path_candidates(text)
+
+        def _base(intent: BrainIntent, *, response_style: ResponseStyle, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            return BrainPlan(
+                intent=intent,
+                confidence=None,
+                needs_clarification=False,
+                clarifying_question=None,
+                job_id=active_job_id,
+                response_style=response_style,
+                payload=dict(payload or {}),
+                strategy_suggestions={},
+                skill_param_suggestions={},
+                raw_user_message=text,
+            ).to_dict()
+
+        def _clarify(intent: BrainIntent, question: str, *, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            out = _base(intent, response_style=ResponseStyle.TASK, payload=payload)
+            out["needs_clarification"] = True
+            out["clarifying_question"] = question
+            return out
+
+        progress_keywords = ("进度", "状态", "到哪了", "做到哪", "how far", "status", "progress")
+        export_keywords = ("导出", "打包", "zip", "export")
+        resume_keywords = ("继续", "恢复", "resume")
+        translate_keywords = ("翻译", "处理", "跑这个漫画", "translate")
+        correction_keywords = ("应该翻译成", "改成", "统一成", "术语", "翻译错", "修正", "修改")
+        rerun_keywords = ("重跑", "重试", "重新", "rerun", "retry")
+        rag_import_keywords = ("rag bundle", "rag文档", "术语表", "glossary", "bundle")
+
+        if any(keyword in lower for keyword in progress_keywords):
+            return _base(BrainIntent.QUERY_PROGRESS, response_style=ResponseStyle.STATUS)
+
+        if any(keyword in lower for keyword in export_keywords):
+            return _base(BrainIntent.EXPORT_RESULT, response_style=ResponseStyle.TASK)
+
+        if any(keyword in lower for keyword in resume_keywords):
+            payload: Dict[str, Any] = {}
+            context_job_id = str((brain_context or {}).get("latest_job_id") or "").strip()
+            if context_job_id:
+                payload["job_id"] = context_job_id
+            return _base(BrainIntent.RESUME_JOB, response_style=ResponseStyle.STATUS, payload=payload)
+
+        if ("导入" in text or "import" in lower) and (
+            any(keyword in lower for keyword in rag_import_keywords)
+            or any(str(candidate).strip().lower().endswith(".json") for candidate in path_candidates)
+        ):
+            if not path_candidates:
+                return _clarify(
+                    BrainIntent.IMPORT_RAG_BUNDLE,
+                    "请把要导入的 RAG bundle 路径发我，例如 `./memory/batman_bundle.json`。",
+                )
+            return _base(
+                BrainIntent.IMPORT_RAG_BUNDLE,
+                response_style=ResponseStyle.TASK,
+                payload={"rag_bundle_path": path_candidates[0]},
+            )
+
+        if any(keyword in lower for keyword in translate_keywords) and ("漫画" in text or path_candidates):
+            if not path_candidates:
+                return _clarify(
+                    BrainIntent.CREATE_TRANSLATION_JOB,
+                    "请把漫画文件路径发我，例如 `./mangatest/xxx.cbz` 或 `/Users/jay/Downloads/xxx.cbz`。",
+                    payload={
+                        "target_language": target_language,
+                        "pipeline_mode": pipeline_mode or "vlm",
+                        "reading_direction": "ltr",
+                        "source_language": "en",
+                    },
+                )
+            return _base(
+                BrainIntent.CREATE_TRANSLATION_JOB,
+                response_style=ResponseStyle.TASK,
+                payload={
+                    "input_path": path_candidates[0],
+                    "target_language": target_language,
+                    "pipeline_mode": pipeline_mode or "vlm",
+                    "reading_direction": "ltr",
+                    "source_language": "en",
+                },
+            )
+
+        if any(keyword in lower for keyword in correction_keywords):
+            if not has_active_job:
+                return _clarify(
+                    BrainIntent.REVISE_TRANSLATION,
+                    "当前没有活动任务。请先提供漫画文件路径创建任务，或者先恢复一个已有任务。",
+                )
+            detail = self.plan_user_message(
+                user_message=text,
+                page_count=int((brain_context or {}).get("page_count") or 0),
+                pipeline_mode=pipeline_mode,
+                target_language=target_language,
+                brain_context=brain_context,
+                skill_context=skill_context,
+            )
+            return {
+                **_base(BrainIntent.REVISE_TRANSLATION, response_style=ResponseStyle.TASK),
+                "payload": {
+                    "reference_page_number": detail.get("reference_page_number"),
+                    "scope": detail.get("scope"),
+                    "from_side": detail.get("from_side"),
+                    "from_text": detail.get("from_text"),
+                    "to_text": detail.get("to_text"),
+                    "glossary_type": detail.get("glossary_type"),
+                    "apply_glossary": detail.get("apply_glossary"),
+                },
+                "confidence": detail.get("confidence"),
+                "needs_clarification": bool(detail.get("needs_clarification")),
+                "clarifying_question": detail.get("clarifying_question"),
+                "strategy_suggestions": dict(detail.get("strategy_suggestions") or {}),
+                "skill_param_suggestions": dict(detail.get("skill_param_suggestions") or {}),
+            }
+
+        if any(keyword in lower for keyword in rerun_keywords):
+            if not has_active_job:
+                return _clarify(
+                    BrainIntent.RERUN_PAGE,
+                    "当前没有活动任务。请先提供漫画文件路径创建任务，或者先恢复一个已有任务。",
+                )
+            detail = self.plan_user_message(
+                user_message=text,
+                page_count=int((brain_context or {}).get("page_count") or 0),
+                pipeline_mode=pipeline_mode,
+                target_language=target_language,
+                brain_context=brain_context,
+                skill_context=skill_context,
+            )
+            target_stage = "page"
+            if "擦除" in text:
+                target_stage = "erase"
+            elif "嵌字" in text or "排版" in text:
+                target_stage = "typeset"
+            elif "重翻" in text or "vlm" in lower:
+                target_stage = "vlm"
+            return {
+                **_base(BrainIntent.RERUN_PAGE, response_style=ResponseStyle.TASK),
+                "payload": {
+                    "reference_page_number": detail.get("reference_page_number"),
+                    "scope": detail.get("scope"),
+                    "target_stage": target_stage,
+                },
+                "confidence": detail.get("confidence"),
+                "needs_clarification": bool(detail.get("needs_clarification")),
+                "clarifying_question": detail.get("clarifying_question"),
+                "strategy_suggestions": dict(detail.get("strategy_suggestions") or {}),
+                "skill_param_suggestions": dict(detail.get("skill_param_suggestions") or {}),
+            }
+
+        if has_active_job and any(keyword in lower for keyword in ("这页", "这一页", "当前任务", "这个任务")):
+            return _base(BrainIntent.QUERY_PROGRESS, response_style=ResponseStyle.STATUS)
+
+        return _base(BrainIntent.CHAT, response_style=ResponseStyle.CHAT)
+
+    def reply_chat_message(
+        self,
+        *,
+        user_message: str,
+        brain_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        cfg = self.config
+        mode = (os.getenv("MANGA_AGENT_BRAIN_MODE", "auto") or "auto").lower().strip()
+        if (not cfg.enabled) or mode == "off":
+            return "我可以正常聊天，也可以帮你创建或继续漫画翻译任务。你可以直接说：帮我翻译 `./mangatest/xxx.cbz`。"
+
+        if not (os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")):
+            return "我可以陪你聊天，也可以帮你处理漫画翻译任务。比如你可以直接说：帮我翻译 `./mangatest/xxx.cbz`。"
+
+        try:
+            from langchain_core.messages import HumanMessage, SystemMessage
+            from orchestrator.llm_adapter import LLMConfig, build_chat_llm
+        except Exception:
+            return "我可以陪你聊天，也可以帮你处理漫画翻译任务。比如你可以直接说：帮我翻译 `./mangatest/xxx.cbz`。"
+
+        system = SystemMessage(
+            content=(
+                "You are the chat-facing brain of a comic translation agent. "
+                "Reply naturally like a normal assistant. "
+                "Use recent_chat_history and recent_job_brain_memory to maintain continuity when the user says things like 'again', 'continue', or 'what about that one'. "
+                "If the user is not asking to run the comic pipeline, do not mention internal system details unless helpful. "
+                "Keep answers concise and practical."
+            )
+        )
+        payload = {
+            "user_message": str(user_message or ""),
+            "brain_context": brain_context or {},
+        }
+        llm = build_chat_llm(
+            LLMConfig(
+                model=os.getenv("MANGA_AGENT_BRAIN_MODEL", cfg.model),
+                temperature=float(os.getenv("MANGA_AGENT_BRAIN_TEMPERATURE", str(cfg.temperature))),
+            )
+        )
+        try:
+            resp = llm.invoke([system, HumanMessage(content=json.dumps(payload, ensure_ascii=False))])
+            text = resp.content if isinstance(resp.content, str) else str(resp.content)
+            text = text.strip()
+            if text:
+                return text
+        except Exception:
+            pass
+        return "我可以正常聊天，也可以帮你创建或继续漫画翻译任务。你可以直接说：帮我翻译 `./mangatest/xxx.cbz`。"
 
     def plan_user_message(
         self,
