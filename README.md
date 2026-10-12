@@ -1,502 +1,136 @@
-# Manga Translation Agent (WIP)
+# 漫画翻译 Agent · Manga Translation Agent
 
-This repo is building a workflow-driven Comic/Manga translation agent.
+**英文原页进，中文成品出**——把漫画翻译做成一条可调度、可返工、可记忆的 Agent 流水线，而不是「OCR + 翻译 + P 图」的串联脚本。
 
-The orchestrator is the source of truth for execution + retries; “skills” are pure capability modules.
+> A workflow-driven manga translation agent: page in, translated & re-typeset page out. Built around a Brain + Orchestrator + Skills state machine, with dual-signal text localization, remote LaMa inpainting, RAG/Memory for terminology consistency, and per-step QA.
 
-## Quickstart (dev)
+## Demo 效果
+
+| 英文原页 | 中文成品 |
+| :---: | :---: |
+| ![英文原页](docs/images/demo-1-original.jpg) | ![中文成品](docs/images/demo-6-translated.jpg) |
+
+## 它是怎么做到的
+
+<table>
+  <tr>
+    <th>1 英文原图</th>
+    <th>2 文本热力图</th>
+    <th>3 BBox 归一化</th>
+  </tr>
+  <tr>
+    <td><img src="docs/images/demo-1-original.jpg"></td>
+    <td><img src="docs/images/demo-2-heatmap.jpg"></td>
+    <td><img src="docs/images/demo-3-bbox.jpg"></td>
+  </tr>
+  <tr>
+    <td>输入完整漫画页，画面与英文气泡均保留。</td>
+    <td>热力图标出文字响应区域，作为精细 mask 的 seed。</td>
+    <td>VLM 输出的文本框经 prompt 归一化，与热力图对齐并过滤无关区域。</td>
+  </tr>
+  <tr>
+    <th>4 精细 Mask</th>
+    <th>5 LaMa 擦除</th>
+    <th>6 中文嵌字</th>
+  </tr>
+  <tr>
+    <td><img src="docs/images/demo-4-mask.jpg"></td>
+    <td><img src="docs/images/demo-5-erased.jpg"></td>
+    <td><img src="docs/images/demo-6-translated.jpg"></td>
+  </tr>
+  <tr>
+    <td>heatmap 与 bbox 融合，精确覆盖文字并保护气泡边框。</td>
+    <td>按最终 mask 做 inpainting，修复背景得到干净底图。</td>
+    <td>按气泡形状、文字方向、字号与可读性重新排版。</td>
+  </tr>
+</table>
+
+处理链路：`检测 heatmap → 归一化 bbox → heatmap + bbox 融合 mask → LaMa inpainting → 按气泡几何嵌字`
+
+## 为什么不只是「OCR + 翻译 + P 图」
+
+漫画翻译真正难的地方在于：
+
+- 某一步失败后，不知道该从哪一步重跑——所以每个环节都是独立 Skill，可单独重做，不用整页重来；
+- 用户只改一个术语时，不应该整本重新处理——所以引入 Memory，让修订沉淀下来；
+- 去字要兼顾「擦干净」和「不伤气泡边框」——所以用两路信号互相校验生成精细 mask；
+- 重型模型（LaMa inpainting）不该绑死在一台机器上——所以解耦成远程服务，按需调用。
+
+## 架构：Brain + Orchestrator + Skills 状态机
+
+```
+输入(单页/整本压缩包)
+      │
+      ▼
+┌─────────────┐   决策/策略    ┌────────────────┐
+│    Brain    │ ◄───────────► │  Orchestrator  │  按状态机调度，失败重试、可回滚
+│ (理解/规划)  │               │  (执行真源)     │
+└─────────────┘               └───────┬────────┘
+                                      │ 逐个调用
+        ┌─────────────┬───────────────┼───────────────┬─────────────┐
+        ▼             ▼               ▼               ▼             ▼
+   输入标准化      检测+定位        翻译(+RAG       去字(LaMa      嵌字排版
+   (pdf/zip…)    (heatmap+bbox)   /Memory 术语)   远程服务)     + QA 打分
+                                      │
+                                      ▼
+                              中间产物全部落盘，
+                              可从任意环节重跑
+```
+
+每个 Skill 是纯能力模块，可独立调用；Orchestrator 是执行与重试的真源；Brain 负责理解页面与给出策略建议。
+
+## 关键设计
+
+- **定位纠偏**：VLM 直接输出的文本框存在偏移，不直接采用——用 prompt 约束其输出归一化 bbox，再与文本热力图互相校验、对齐。两类信号的错误模式不同，交集更可靠。
+- **精确去字**：融合热力图 seed 与归一化 bbox 生成精细 mask，覆盖文字同时保护气泡边框；LaMa 部署为远程 inpainting 服务，按 mask 修回干净背景。
+- **一致性**：RAG / Memory 维护术语表与译名，保证同一角色、同一设定跨页翻译一致——单页翻得再好，译名前后不一致，读者照样出戏。
+- **质量闭环**：本地 QA 对每步产出打分，作为进入下一环节或重做的判断依据。
+
+## 快速开始
 
 ```bash
-/opt/homebrew/bin/python3.11 -m venv .venv
+# 1. 环境（Python 3.9+，开发用 3.11）
+python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# 2. 系统依赖
+brew install poppler   # pdf2image 需要（输入为 PDF 时）
+brew install rar       # unrar（输入为 .rar/.cbr 时）
+
+# 3. 配置 LaMa inpainting 服务地址
+cp config/runtime.example.json config/runtime.json
+#    编辑 runtime.json，指向你的 LaMa 服务（部署见 docs/windows_lama_deployment.md）
+
+# 4. 运行
+python run_pipeline.py --input /path/to/漫画.zip
+# 也支持单页图片、图片目录、pdf/cbz/cbr/rar；常用参数：
+#   --output data/output     输出目录
+#   --max-pages 3            先跑前几页试试
+#   --rag-bundle xxx.json    导入历史术语/记忆包
 ```
 
-### Runtime notes
+## 项目结构
 
-- `pdf2image` requires Poppler (`pdftoppm`).
-- `rarfile` may require `unrar` for `.rar/.cbr`.
-- For the current Windows-side inpaint service contract, see `docs/windows_manga_cleaner_service_spec.md`.
-
-## Design Spec (working notes)
-
-This section is written as an implementation spec (not user documentation).
-
-### Product constraints
-
-- Primary translation: **English → Chinese**.
-- Japanese: keep interfaces only (no implementation in v0).
-- Reading order is a **user option**; default is **English LTR**.
-- SFX/stylized lettering is **out-of-scope** for v0; keep extension points.
-- Corrections happen **within the same job** (no cross-session correction UX).
-- Packaging output uses **ZIP** (RAR mentioned earlier only meant “archive”).
-
-### Canonical identifiers (must be carried across all steps)
-
-All skills MUST preserve these identifiers so we can re-run minimal subsets:
-
-```text
-job_id: string
-page_index: int   (0-based)
-region_id: int    (bubble id, unique within a page)
+```
+main.py / run_pipeline.py   # CLI 入口与输入标准化
+orchestrator/               # ComicAgent、决策引擎、状态存储、job 落盘
+skills/                     # 各环节能力模块（检测、翻译、去字、嵌字…）
+qa/                         # 逐步骤质量评估
+memory/                     # RAG / 共享记忆
+models/                     # 本地模型权重（gitignored）
+config/                     # 运行时配置（服务地址等）
+docs/                       # 架构与服务部署设计文档
+scripts/                    # brain CLI、远程调用与离线测试脚本
 ```
 
-Optional stable ids for future speaker alignment:
+## 更多文档
 
-```text
-utterance_id: string  (stable within job; derived from page_index+region_id)
-speaker_id: string | null
-```
+- [作品集：漫画 Agent 搭建历程](作品集_漫画Agent搭建历程.md)——从串行 Workflow 到 Agent 架构的完整演化与取舍
+- [Memory / RAG 架构设计](docs/memory_rag_architecture.md)
+- [共享记忆（SQLite）设计](docs/sqlite_shared_memory_design.md)
+- [Windows 端 LaMa 服务部署](docs/windows_lama_deployment.md) 与 [服务协议](docs/windows_fastapi_lama_service_spec.md)
 
-### Workflow (orchestrator-driven)
+## 状态
 
-```text
-Classic (fallback)
-	InputNormalization
-		-> PanelTextDetection
-			-> RegionOCR
-				-> ScriptBuilder(v0)
-					-> Translation(en->zh, glossary-aware)
-						-> LaMaErase(v0)
-							-> Lettering(v0, block text)
-							-> PackageZIP
-
-VLM core (new)
-	InputNormalization
-		-> Job-level VLM batching (default: 10 contiguous pages)
-			-> VLMPageTranslate(qwen3.6-plus: detect+OCR+translate)
-			-> LaMaErase(v0)
-				-> Lettering(v0, block text)
-				-> PackageZIP
-```
-
-Switching policy:
-
-- Set `job.user_preferences.pipeline_mode` to `classic` or `vlm` (CLI supports `--pipeline-mode`).
-
-Token/quality knob (VLM):
-
-- `MANGA_AGENT_VLM_BATCH_SIZE` (default: `10`, max recommended: `10`). The job-level brain opens one contiguous VLM page window at a time.
-- `MANGA_AGENT_VLM_MAX_HEIGHT` (default: `0`). V1 defaults to full-resolution upload; set a positive value only if you explicitly want to downscale before the VLM call.
-- `MANGA_AGENT_VLM_MAX_WIDTH` (default: `0`, meaning no cap). If set (e.g. `3057`), width larger than this will be downscaled too (cheaper but may affect double-page spreads).
-- `MANGA_AGENT_VLM_MAX_LONG_SIDE` (default: `0`, optional extra safety cap).
-
-Fallback policy:
-
-- If the first VLM call was downscaled and returned **0 regions**, the orchestrator retries once with full resolution (costs more tokens but avoids missing-page failures).
-
-Hybrid QA policy (VLM):
-
-- **Obvious failures** are handled by the heuristic gate (empty texts, wrong language, 0 regions but detector found text), and may trigger an automatic VLM retry (budgeted).
-- **Non-obvious cases** can be evaluated by a **text-only LLM judge** (no image upload). The judge receives region `src_text/tgt_text` samples + summary metrics, and returns `proceed|retry|ask_user`.
-
-Judge knobs (text-only):
-
-- `MANGA_AGENT_VLM_JUDGE_MODE` = `off|auto|on` (default: `auto`)
-- `MANGA_AGENT_VLM_JUDGE_MODEL` (default: `qwen3-max`)
-- `MANGA_AGENT_VLM_JUDGE_TEMPERATURE` (default: `0.0`)
-- `MANGA_AGENT_VLM_JUDGE_MAX_REGIONS` (default: `12`)
-- `MANGA_AGENT_VLM_JUDGE_MAX_TEXT_LEN` (default: `280`)
-
-### Route A: “Agent brain” + text-only revision
-
-To behave like an **agent** (not just a fixed pipeline), the orchestrator supports a Route-A loop:
-
-1) User sends feedback/correction in natural language.
-2) A **DecisionBrain (LLM)** parses it into a structured plan (`job.pending_user_plan`).
-3) The DecisionEngine executes the plan (ask user / rerun page / run revision).
-4) For corrections, we run a **text-only revision skill** that patches existing VLM outputs (no image upload, no VLM rerun).
-5) Only affected pages are re-lettered, reusing cached erased pages whenever possible.
-
-Job-level brain:
-
-- The orchestrator now has a job-level strategy layer above page-level decisions.
-- In `vlm` mode it decides when to open the next contiguous VLM page window.
-- Default policy: finish active translated/erase/typeset pages first, then open the next VLM batch of up to 10 pages.
-
-Brain knobs:
-
-- `MANGA_AGENT_BRAIN_MODE` = `off|auto` (default: `auto`)
-- `MANGA_AGENT_BRAIN_MODEL` (default: `qwen3-max`)
-- `MANGA_AGENT_BRAIN_TEMPERATURE` (default: `0.0`)
-
-Revision knobs (text-only):
-
-- `MANGA_AGENT_REVISION_MODEL` (default: `qwen3-max`)
-- `MANGA_AGENT_REVISION_TEMPERATURE` (default: `0.0`)
-- `MANGA_AGENT_REVISION_MAX_CANDIDATE_PAGES` (default: `12`)
-- `MANGA_AGENT_REVISION_MAX_PATCHES` (default: `64`)
-
-LLM responsibilities (v0):
-
-- Translate with glossary constraints.
-- Judge (text-only) for non-obvious quality issues.
-- Parse user corrections into a plan (DecisionBrain).
-- Apply text-only translation revision (patch `tgt_text` + emit `glossary_updates`).
-
-### Job lifecycle (single-job correction loop)
-
-The job runs until it reaches a “review/correction loop”:
-
-```text
-RUN (produce draft outputs)
-	-> WAITING_USER (review/correct)
-		-> (apply corrections) -> rerun MINIMAL affected regions
-		-> WAITING_USER
-	-> (user confirms export) -> COMPLETED + ZIP output
-```
-
-User-facing correction inputs we support:
-
-1) Upload a glossary file update.
-2) Natural language message like:
-	 - “希望力量陪着你 翻译错了，应该是 原力与你同在”
-
-Correction MUST NOT require users to provide `page_index/region_id`.
-
-### Artifacts (internal + returned)
-
-Even if correction is “within job”, we still generate editable artifacts so users can adjust terms:
-
-- `glossary.json` (editable by user; re-upload to update within job)
-- `run_manifest.json` (internal index; used to map text -> page/bubble)
-- `vlm_batches.json` (raw batch/window execution records)
-- `revision_batches.json` (raw revision-window execution records)
-- `erased/page_XXXX.png` (cached inpaint result; reused for re-typesetting)
-- `masks/page_XXXX_coarse.png` (coarse region mask before completion)
-- `masks/page_XXXX_refined.png` (final page mask sent to LaMa)
-- `masks/page_XXXX_overlay.png` (debug overlay to inspect mask quality)
-- `memory/glossary.json`
-- `memory/translation_memory.json`
-- `memory/style_memory.json`
-- `memory/project_memory.json`
-- `memory/brain_memory.json`
-
-NOTE: `run_manifest.json` should be considered internal; it is allowed to be packaged but is not meant as user UX.
-
-### `run_manifest.json` structure (current)
-
-The manifest now exposes both a batch view and a page view so downstream tools can inspect either the window-level flow or a single-page state without rebuilding the mapping themselves.
-
-```text
-run_manifest.json
-  workflow
-    pipeline_mode
-    vlm_batch_size
-    job_brain{summary, confidence, stage_last, strategy_suggestions}
-  batch_views
-    vlm_windows[]
-    revision_windows[]
-  page_views
-    summary{page_count, stage_counts, rendered_pages, erased_pages}
-    page_to_vlm_window
-    page_to_revision_windows
-    pages[]
-```
-
-Backward-compatible flat keys are still preserved for older tooling:
-
-- `job_brain`
-- `vlm_batch_size`
-- `vlm_batches`
-- `revision_batches`
-- `pages`
-
-### LaMa mask chain (current)
-
-The erase path is now explicitly split into:
-
-```text
-region metadata -> remote text detect -> client-side mask refinement -> LaMa
-```
-
-Current default is `mask_source_mode = manga_auto_hybrid`.
-
-Detailed flow:
-
-1. VLM supplies per-region metadata:
-   - `bbox_xyxy`
-   - `has_text_box`
-   - translated text and style hints
-2. The Windows service runs `manga-cleaner`-style text detection and returns:
-   - a raw detect mask
-   - a heatmap/debug mask
-3. The client builds a **hybrid mask**:
-   - use the heatmap as the tight seed
-   - use the raw detect mask as the growth envelope
-   - use VLM bbox only to assign/filter components per region
-   - do **not** rasterize bbox rectangles into the final mask silhouette
-4. The seed is dilated inside the envelope until it covers text strokes well enough without jumping to the full raw blob.
-5. The final page mask plus overlay/debug artifacts are persisted locally.
-6. LaMa receives only `image + final mask + profile`.
-
-Current tuned default for `page002` / DC speech-bubble pages:
-
-- `mask_source_mode = manga_auto_hybrid`
-- `hybrid_seed_safe_expand_px = 5`
-- `hybrid_envelope_safe_expand_px = 40`
-- `hybrid_growth_iterations = 15`
-- `hybrid_growth_kernel_px = 3`
-- tuning comment: `DC-Nightwing`
-
-Fallback behavior:
-
-- if the remote detector returns no usable heatmap, the pipeline falls back to `manga_auto_constrained`
-- if remote detect is unavailable, the old local heuristic mask path still exists as a last resort
-
-Important consequence: improving erase quality for cases like `test3` is primarily a mask problem first, not an inpainting-model switch first.
-
-### Glossary / RAG (v0 contract)
-
-We implement “RAG” as a pluggable retrieval layer. v0 can be exact/alias matching;
-later we can swap retrieval backend to vector DB without changing the translation I/O.
-
-Current retrieval inputs include:
-
-- locked glossary entries
-- user-confirmed translation memory from revision
-- style hints
-- project rules
-- neighbor-page translated examples
-
-Brain planning uses a separate `brain_memory.json` bucket for recent user intents / corrections,
-but it reuses the same retrieval layer to pull relevant terminology, style hints, and project rules.
-
-`glossary.json` example:
-
-```json
-{
-	"version": "0.1.0",
-	"entries": [
-		{
-			"entry_id": "e_force_001",
-			"type": "quote",
-			"src_text": "may the force be with you",
-			"tgt_text": "原力与你同在",
-			"aliases_src": ["May the Force be with you"],
-			"aliases_tgt": ["希望力量陪着你"],
-			"locked": true,
-			"updated_at": "2026-04-04T00:00:00Z"
-		}
-	]
-}
-```
-
-Key behaviors:
-
-- Auto-learned entries are `locked=false` by default.
-- User-edited entries are `locked=true`.
-- When user corrects by Chinese text, we must be able to find the relevant entry/occurrence via:
-	- `aliases_tgt` and
-	- `run_manifest.json` reverse index (translated_text -> page_index/region_id)
-
-### Skill contracts (v0)
-
-All skills should use a consistent envelope:
-
-```text
-{
-	ok: bool,
-	data: <payload>,
-	metrics: { ... },
-	trace: { job_id, page_index?, region_id? },
-	error: { code, message, detail? } | null
-}
-```
-
-#### Skill0: input_normalization
-
-Input:
-
-```text
-file_bytes, file_type
-```
-
-Output payload:
-
-```text
-pages: [{page_index, image_bytes, filename}]
-```
-
-#### Skill1: panel_text_detection
-
-Input:
-
-```text
-page_index, image_bytes, model_choice, conf_threshold, iou_threshold, imgsz
-```
-
-Output payload:
-
-```text
-regions: [{region_id, bbox_xywh, score, region_type}]
-image_size: {width, height}
-
-#### Skill1b: vlm_page_translate (VLM core)
-
-Input:
-
-```text
-page_range{start_page_index,end_page_index,page_count,page_indices},
-pages[{page_index, image_bytes, retrieval_context?}],
-reading_direction,
-source_language=en,
-target_language=zh
-```
-
-Output payload:
-
-```text
-page_range{start_page_index,end_page_index,page_count,page_indices,label}
-pages[
-  {
-    page_index,
-    regions: [{region_id, bbox_xywh, has_text_box, src_text, tgt_text}]
-  }
-]
-```
-```
-
-The recommended page window size is `<=10`.
-
-#### Skill2: region_ocr
-
-Input:
-
-```text
-page_index, image_bytes, regions[bbox_xywh], source_language=en
-```
-
-Output payload:
-
-```text
-results: {region_id: {text, confidence?, flags[]}}
-```
-
-#### Skill3: script_builder_v0
-
-Input:
-
-```text
-page_index, regions[{region_id, bbox_xywh, ocr_text}], reading_direction
-```
-
-Output payload:
-
-```text
-utterances: [{order_index, utterance_id, region_id, clean_text, speaker_id?}]
-page_context: string
-```
-
-#### Skill4: translate_script_en2zh
-
-Input:
-
-```text
-utterances, page_context, glossary_context, character_profiles?
-```
-
-Output payload:
-
-```text
-results: {region_id: {translated_text, confidence?}}
-memory_updates: [{entry_id?, src_text, tgt_text, aliases_tgt?}]
-conflicts: [{src_text, candidates[]}] 
-```
-
-#### Skill4b: lama_eraser
-
-Input:
-
-```text
-page_index, page_range?, image_bytes,
-regions[{region_id, bbox_xywh, has_text_box, translated_text?}],
-erase_params_hint?{
-  profile,
-  mask_dilate_px,
-  mask_min_coverage,
-  mask_max_coverage,
-  embedded_box_expand_px,
-  embedded_complete_mask_close_px
-}
-```
-
-Output payload:
-
-```text
-erased_image_bytes
-coarse_mask_bytes
-mask_bytes
-mask_overlay_bytes
-results: {region_id: {erase_ok}}
-metrics: {
-  erase_backend,
-  erase_profile,
-  mask_strategy,
-  mask_pixels,
-  embedded_regions,
-  region_metrics[]
-}
-```
-
-#### Skill5: lettering_basic_v0
-
-Input:
-
-```text
-page_index, page_range?, image_bytes, regions[{region_id, bbox_xywh, has_text_box, translated_text}], render_params_hint?
-```
-
-Output payload:
-
-```text
-rendered_image_bytes
-results: {region_id: {render_ok, overflow, render_params}}
-```
-
-#### Skill5b: vlm_translation_revision
-
-Input:
-
-```text
-document_range{start_page_index,end_page_index,page_count,page_indices,label},
-pages[{page_index, regions[{region_id, bbox_xywh, has_text_box, src_text, tgt_text}]}],
-revision_mode,
-user_request,
-retrieval_context?,
-glossary?
-```
-
-Output payload:
-
-```text
-decision
-document_range
-pages
-changed_pages
-patches
-glossary_updates
-warnings
-```
-
-#### Skill6: package_zip
-
-Input:
-
-```text
-pages[{page_index, image_bytes, filename}], glossary.json, run_manifest.json
-```
-
-Output payload:
-
-```text
-zip_bytes, zip_filename
-```
-
-### Implementation milestones (next)
-
-1) Fix skill defaults (detection model paths + imgsz=1280).
-2) Add LangChain LLM adapter using DashScope OpenAI-compatible endpoint (Qwen).
-3) Implement `translate_script_en2zh` (v0) with glossary context + JSON output.
-4) Move `main.py` to orchestrator-driven CLI (thin wiring only).
-5) Add VLM core workflow (qwen3.6-plus) + `pipeline_mode` switch.
+原型（WIP）：主链路可跑通，QA 打分准确性仍在迭代中。
