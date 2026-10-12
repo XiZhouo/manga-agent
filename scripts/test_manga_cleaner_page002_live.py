@@ -28,7 +28,7 @@ DEFAULT_IMAGE = Path("data/test_runs/page002_vlm_agent_live/page_0002/page.png")
 DEFAULT_VLM_RESULT = Path("data/test_runs/page002_vlm_agent_live/page_0002/vlm_result.json")
 DEFAULT_EXTERNAL_MASK = Path("data/test_runs/inpaint/page002_json_bbox_mask_xyxy_byqwen1/input_mask.png")
 DEFAULT_OUTPUT = Path("data/test_runs/manga_cleaner_page002_live")
-DEFAULT_URL = "http://100.118.147.113:9171"
+DEFAULT_URL = "http://<windows-host>:9171"
 
 
 def _b64(data: bytes) -> str:
